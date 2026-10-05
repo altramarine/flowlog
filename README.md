@@ -57,7 +57,7 @@ small standalone Rust projects exercise the corresponding dogs3 operator:
 | Directory | Program |
 | --- | --- |
 | [`tmp/dogsdogsdogs-topcats-quicktest`](tmp/dogsdogsdogs-topcats-quicktest) | Initial dogs3 Topcats quick test. |
-| [`tmp/dogsdogsdogs-triangle-topcats`](tmp/dogsdogsdogs-triangle-topcats) | Triangle comparison with the incremental/operator experiment. |
+| [`tmp/dogsdogsdogs-triangle-topcats`](tmp/dogsdogsdogs-triangle-topcats) | Triangle comparison with the separate-index/operator experiment. |
 | [`tmp/dogsdogsdogs-triangle-topcats-batch`](tmp/dogsdogsdogs-triangle-topcats-batch) | Batch-mode comparison. It loads one relation, builds forward and reverse dogs3 indexes, uses `count` to choose an extension direction, then `propose` and `validate` to produce triangles. |
 
 The runners are:
@@ -67,12 +67,13 @@ The runners are:
 - [`tmp/run_triangle_dogsdogsdogs_compare.sh`](tmp/run_triangle_dogsdogsdogs_compare.sh)
 - [`tmp/run_triangle_dogsdogsdogs_batch_compare.sh`](tmp/run_triangle_dogsdogsdogs_batch_compare.sh)
 
-The batch run at
-[`tmp/triangle-dogsdogsdogs-batch-compare/20260930T170825Z`](tmp/triangle-dogsdogsdogs-batch-compare/20260930T170825Z)
-used `wiki-topcats.csv` with 32 workers. Both implementations reported
-27,691,482 triangles. FlowLog's recorded wall time was 7.47 s with 12.12 GiB
-maximum RSS; dogs3's was 7.70 s with 22.97 GiB maximum RSS. The result logs
-and exact commands are versioned alongside the small configuration file.
+The recorded results are collected in
+[`tmp/triangle-dogsdogsdogs-results.md`](tmp/triangle-dogsdogsdogs-results.md).
+Every listed run used `wiki-topcats.csv` and 32 workers; both implementations
+reported 27,691,482 triangles in every run. The batch-aligned run recorded
+7.47 s and 12.12 GiB maximum RSS for FlowLog, and 7.70 s and 22.97 GiB for
+dogs3. The results document distinguishes that batch comparison from the
+earlier operator experiment, whose construction is different.
 
 ### DOOP cyclic-rule profile
 
