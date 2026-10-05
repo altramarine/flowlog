@@ -1,0 +1,183 @@
+// --------------------------------------------------------------------------
+//  worst-case-optimal split plan  ->  FlowLog / Souffle
+//
+//  query :  Arc(a, b), Arc(b, c), Arc(c, d), Arc(d, e), Arc(e, a)
+//  atoms :  R1=Arc(a,b)  R2=Arc(b,c)  R3=Arc(c,d)  R4=Arc(d,e)  R5=Arc(e,a)
+//
+//  plan  :
+//    split start=R1
+//      split start=R3
+//        split start=R2
+//          leaf: {R1__R2__R5, R3__R4} [acyclic]
+//          leaf: {R1__R5, R2__R3__R4} [acyclic]
+//        split start=R4
+//          leaf: {R1__R4__R5, R2__R3} [acyclic]
+//          leaf: {R1__R5, R2__R3__R4} [acyclic]
+//      split start=R4
+//        split start=R1__R2
+//          leaf: {R1__R2__R3, R4__R5} [acyclic]
+//          leaf: {R1__R2__R3__R4__R5} [acyclic]
+//        split start=R5
+//          leaf: {R1__R2, R3__R4__R5} [acyclic]
+//          leaf: {R1__R2__R5, R3__R4} [acyclic]
+//
+//  Each split compares OutDeg (deg0) of one neighbour against InDeg
+//  (deg1) of the other -- proxies for the extension degree, read off
+//  the neighbour's base edge at the shared variable.  Fixed rule:
+//     light branch (deg0) :  deg0 <= deg1
+//     heavy branch (deg1) :  deg1 <  deg0
+//  complementary, so the leaves partition the start tuples and every
+//  answer is produced exactly once.
+// --------------------------------------------------------------------------
+
+.decl Arc(x: int32, y: int32)
+.input Arc(IO="file", filename="Arc.csv", delimiter=",")
+
+// vertex in / out degree in the base edge relation
+.decl OutDeg(x: int32, k: int32)
+.decl InDeg(x: int32, k: int32)
+OutDeg(x, count(y)) :- Arc(x, y).
+InDeg(y, count(x)) :- Arc(x, y).
+
+.decl R1__R2(a: int32, b: int32, c: int32)
+// split start=R1 | candidate R2 (light)
+R1__R2(a, b, c) :-
+    Arc(a, b),
+    OutDeg(b, deg0),
+    InDeg(a, deg1),
+    deg0 <= deg1,
+    Arc(b, c).
+
+.decl R3__R4(c: int32, d: int32, e: int32)
+// split start=R4 | candidate R3 (heavy)
+R3__R4(c, d, e) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg1 < deg0,
+    Arc(c, d).
+// split start=R3 | candidate R4 (light)
+R3__R4(c, d, e) :-
+    Arc(c, d),
+    OutDeg(d, deg0),
+    InDeg(c, deg1),
+    deg0 <= deg1,
+    Arc(d, e).
+
+.decl R1__R2__R5(a: int32, b: int32, c: int32, e: int32)
+// split start=R5 | candidate R1__R2 (light)
+R1__R2__R5(a, b, c, e) :-
+    Arc(e, a),
+    OutDeg(a, deg0),
+    InDeg(e, deg1),
+    deg0 <= deg1,
+    R1__R2(a, b, c).
+// split start=R2 | candidate R1__R5 (heavy)
+R1__R2__R5(a, b, c, e) :-
+    Arc(b, c),
+    OutDeg(c, deg0),
+    InDeg(b, deg1),
+    deg1 < deg0,
+    R1__R5(a, b, e).
+
+.decl R3__R4__R5(c: int32, d: int32, e: int32, a: int32)
+// split start=R5 | candidate R3__R4 (heavy)
+R3__R4__R5(c, d, e, a) :-
+    Arc(e, a),
+    OutDeg(a, deg0),
+    InDeg(e, deg1),
+    deg1 < deg0,
+    R3__R4(c, d, e).
+
+.decl R4__R5(d: int32, e: int32, a: int32)
+// split start=R4 | candidate R5 (light)
+R4__R5(d, e, a) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg0 <= deg1,
+    Arc(e, a).
+
+.decl R1__R2__R3(a: int32, b: int32, c: int32, d: int32)
+// split start=R1__R2 | candidate R3 (light)
+R1__R2__R3(a, b, c, d) :-
+    R1__R2(a, b, c),
+    OutDeg(c, deg0),
+    InDeg(a, deg1),
+    deg0 <= deg1,
+    Arc(c, d).
+
+.decl R1__R5(a: int32, b: int32, e: int32)
+// split start=R1 | candidate R5 (heavy)
+R1__R5(a, b, e) :-
+    Arc(a, b),
+    OutDeg(b, deg0),
+    InDeg(a, deg1),
+    deg1 < deg0,
+    Arc(e, a).
+
+.decl R2__R3(b: int32, c: int32, d: int32)
+// split start=R3 | candidate R2 (heavy)
+R2__R3(b, c, d) :-
+    Arc(c, d),
+    OutDeg(d, deg0),
+    InDeg(c, deg1),
+    deg1 < deg0,
+    Arc(b, c).
+
+.decl R1__R4__R5(a: int32, b: int32, d: int32, e: int32)
+// split start=R4 | candidate R1__R5 (light)
+R1__R4__R5(a, b, d, e) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg0 <= deg1,
+    R1__R5(a, b, e).
+
+.decl R2__R3__R4(b: int32, c: int32, d: int32, e: int32)
+// split start=R4 | candidate R2__R3 (heavy)
+R2__R3__R4(b, c, d, e) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg1 < deg0,
+    R2__R3(b, c, d).
+// split start=R2 | candidate R3__R4 (light)
+R2__R3__R4(b, c, d, e) :-
+    Arc(b, c),
+    OutDeg(c, deg0),
+    InDeg(b, deg1),
+    deg0 <= deg1,
+    R3__R4(c, d, e).
+
+.decl Result(a: int32, b: int32, c: int32, d: int32, e: int32)
+// leaf {R1__R2__R5, R3__R4}
+Result(a, b, c, d, e) :-
+    R1__R2__R5(a, b, c, e),
+    R3__R4(c, d, e).
+// leaf {R1__R2, R3__R4__R5}
+Result(a, b, c, d, e) :-
+    R1__R2(a, b, c),
+    R3__R4__R5(c, d, e, a).
+// leaf {R1__R2__R3, R4__R5}
+Result(a, b, c, d, e) :-
+    R1__R2__R3(a, b, c, d),
+    R4__R5(d, e, a).
+// split start=R1__R2 | candidate R4__R5 (heavy) (absorbs R3)
+Result(a, b, c, d, e) :-
+    R1__R2(a, b, c),
+    OutDeg(c, deg0),
+    InDeg(a, deg1),
+    deg1 < deg0,
+    R4__R5(d, e, a),
+    Arc(c, d).
+// leaf {R1__R4__R5, R2__R3}
+Result(a, b, c, d, e) :-
+    R1__R4__R5(a, b, d, e),
+    R2__R3(b, c, d).
+// leaf {R1__R5, R2__R3__R4}
+Result(a, b, c, d, e) :-
+    R1__R5(a, b, e),
+    R2__R3__R4(b, c, d, e).
+
+.printsize Result

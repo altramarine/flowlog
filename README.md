@@ -1,165 +1,129 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/flowlog-rs/flowlog/main/FlowLog.png" alt="FlowLog Logo" width="320"/>
-</p>
+# FlowLog `quicktest`
 
+`quicktest` is an experimental snapshot built from FlowLog upstream commit
+[`5d24aaf`](https://github.com/flowlog-rs/flowlog/commit/5d24aaffa357316bd6c6dfac09d8ef6e79aaed9c).
+It collects the local work used to inspect FlowLog plans, compare a 5-cycle
+rewrite, and compare FlowLog's triangle plan with `differential-dogs3`.
+This README deliberately documents the contents of this branch rather than
+duplicating upstream's project README.
 
-<p align="center">
-  <a href="https://crates.io/crates/flowlog-build"><img alt="flowlog-build on crates.io" src="https://img.shields.io/crates/v/flowlog-build?style=flat-square&logo=rust&label=flowlog-build&color=76B900"/></a>
-  <a href="https://docs.rs/flowlog-build"><img alt="flowlog-build docs" src="https://img.shields.io/docsrs/flowlog-build?style=flat-square&logo=docsdotrs&label=docs&color=76B900"/></a>
-  &nbsp;
-  <a href="https://crates.io/crates/flowlog-runtime"><img alt="flowlog-runtime on crates.io" src="https://img.shields.io/crates/v/flowlog-runtime?style=flat-square&logo=rust&label=flowlog-runtime&color=76B900"/></a>
-  <a href="https://docs.rs/flowlog-runtime"><img alt="flowlog-runtime docs" src="https://img.shields.io/docsrs/flowlog-runtime?style=flat-square&logo=docsdotrs&label=docs&color=76B900"/></a>
-  &nbsp;
-  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-76B900?style=flat-square"/></a>
-</p>
+The FlowLog planner, runtime, and compiler sources are unchanged from that
+upstream commit. All branch-specific material is under [`tmp/`](tmp/).
 
-> **status** · under active development; interfaces may change.
+## Branch contents
 
-FlowLog compiles Datalog into efficient and scalable [Differential Dataflow](https://github.com/TimelyDataflow/differential-dataflow) rust executables.</h3> As such, FlowLog has first-class **incremental maintenance** — outputs update without recomputation as facts change. On DOOP points-to it runs **~3.6× faster than Soufflé** across 20 DaCapo programs (32 threads).
+### 5-cycle split-plan rewrite
 
-## Quick Start
-
-**1 — Install the toolchain.** One-time setup — Rust (1.80+) and required OS packages, then a `cargo check` smoke test.
-
-```bash
-$ bash env/env.sh     # Linux / macOS
-PS> .\env\env.ps1     # Windows (elevated PowerShell)
-```
-
-**2 — Build.** The compiler lands at `target/release/flowlog-compiler`.
-
-```bash
-$ cargo build --release
-```
-
-**3 — Run an example.** `example/graph_analysis/reach.dl` — nodes reachable from a seed set:
+The query is a directed 5-cycle over `Arc`:
 
 ```datalog
-.decl Source(id: int32)
-.input Source(IO="file", filename="Source.csv", delimiter=",")
-.decl Arc(x: int32, y: int32)
-.input Arc(IO="file", filename="Arc.csv", delimiter=",")
-
-.decl Reach(id: int32)
-Reach(y) :- Source(y).
-Reach(y) :- Reach(x), Arc(x,y).
-.printsize Reach
+Arc(a, b), Arc(b, c), Arc(c, d), Arc(d, e), Arc(e, a)
 ```
 
-Make a tiny dataset, then compile and run:
+The files preserve each stage of the rewrite.
+
+| File | Purpose |
+| --- | --- |
+| [`tmp/5cycle.dl`](tmp/5cycle.dl) and [`tmp/5cycle.original.dl`](tmp/5cycle.original.dl) | Original translation of the WCOJ split tree. Some IDB names are reused by alternatives below different splits, so FlowLog unions their contents. |
+| [`tmp/5cycle.fixed.dl`](tmp/5cycle.fixed.dl) | First correction: give branch-local intermediate relations separate names and expand the corresponding result rules. |
+| [`tmp/5cycle.indexed.dl`](tmp/5cycle.indexed.dl) | Current version used by the benchmark runner. Internal split-tree nodes are numbered. A relation made before a split is shared by its descendants; a relation made after a split carries the leaf index. This preserves common prefix context while preventing cross-branch unions. |
+| [`tmp/5cycle.baseline.dl`](tmp/5cycle.baseline.dl) | Baseline plan: materialize `R1 join R2 join R3`, materialize `R4 join R5`, then join the two. |
+
+[`tmp/run_topcats_5cycle_compare.sh`](tmp/run_topcats_5cycle_compare.sh) compiles and
+runs `baseline`, `before` (`5cycle.original.dl`), and `after`
+(`5cycle.indexed.dl`) in batch mode. It records the compiler output, program
+output, exit status, and GNU `time -v` report in a timestamped directory. The
+input path and worker count are positional arguments; the default data path is
+the local WCOJ dataset directory.
+
+Small result records from the already-run 5-cycle comparisons are retained in
+`tmp/*-5cycle-compare/`. They include runs on Topcats, 70% and 30% induced
+Topcats subgraphs, BerkStan, and Skitter. The full Topcats record at
+[`tmp/topcats-5cycle-compare/20260928T050808Z/summary.txt`](tmp/topcats-5cycle-compare/20260928T050808Z/summary.txt)
+shows that both split-plan variants terminated with allocation failure on that
+machine, while the baseline completed in 8.13 seconds. These are observations
+from one host configuration, not a performance claim for the rewrite.
+
+[`tmp/make_induced_subgraph.py`](tmp/make_induced_subgraph.py) makes the induced
+Topcats subgraphs. Their small metadata files are retained as
+[`tmp/wiki-topcats-70pct-seed0.stats.txt`](tmp/wiki-topcats-70pct-seed0.stats.txt)
+and [`tmp/wiki-topcats-30pct-seed0.stats.txt`](tmp/wiki-topcats-30pct-seed0.stats.txt).
+
+### Triangle: FlowLog and `differential-dogs3`
+
+[`tmp/triangle.dl`](tmp/triangle.dl) is the FlowLog triangle program. Three
+small standalone Rust projects exercise the corresponding dogs3 operator:
+
+| Directory | Program |
+| --- | --- |
+| [`tmp/dogsdogsdogs-topcats-quicktest`](tmp/dogsdogsdogs-topcats-quicktest) | Initial dogs3 Topcats quick test. |
+| [`tmp/dogsdogsdogs-triangle-topcats`](tmp/dogsdogsdogs-triangle-topcats) | Triangle comparison with the incremental/operator experiment. |
+| [`tmp/dogsdogsdogs-triangle-topcats-batch`](tmp/dogsdogsdogs-triangle-topcats-batch) | Batch-mode comparison. It loads one relation, builds forward and reverse dogs3 indexes, uses `count` to choose an extension direction, then `propose` and `validate` to produce triangles. |
+
+The runners are:
+
+- [`tmp/run_dogsdogsdogs_topcats_quicktest.sh`](tmp/run_dogsdogsdogs_topcats_quicktest.sh)
+- [`tmp/run_dogsdogsdogs_triangle_topcats.sh`](tmp/run_dogsdogsdogs_triangle_topcats.sh)
+- [`tmp/run_triangle_dogsdogsdogs_compare.sh`](tmp/run_triangle_dogsdogsdogs_compare.sh)
+- [`tmp/run_triangle_dogsdogsdogs_batch_compare.sh`](tmp/run_triangle_dogsdogsdogs_batch_compare.sh)
+
+The batch run at
+[`tmp/triangle-dogsdogsdogs-batch-compare/20260930T170825Z`](tmp/triangle-dogsdogsdogs-batch-compare/20260930T170825Z)
+used `wiki-topcats.csv` with 32 workers. Both implementations reported
+27,691,482 triangles. FlowLog's recorded wall time was 7.47 s with 12.12 GiB
+maximum RSS; dogs3's was 7.70 s with 22.97 GiB maximum RSS. The result logs
+and exact commands are versioned alongside the small configuration file.
+
+### DOOP cyclic-rule profile
+
+[`tmp/doop-zxing-cyclic-profile.md`](tmp/doop-zxing-cyclic-profile.md) and
+[`tmp/doop-zxing-cyclic-profile.csv`](tmp/doop-zxing-cyclic-profile.csv) retain
+the processed profile for the ZXing DOOP batch run: 16 workers, string
+interning, 4.28 s wall time, 1.57 GiB peak RSS, and 4,024,065 `VarPointsTo`
+facts. The report separates transformations exclusive to a source rule from
+shared transformations, so overlapping rule totals are not added together.
+
+## Reproducing the runnable experiments
+
+Build the FlowLog compiler first:
 
 ```bash
-$ mkdir -p reach
-$ printf '1\n'        > reach/Source.csv
-$ printf '1,2\n2,3\n' > reach/Arc.csv
-
-# Compile to a binary, then run it on 4 worker threads
-$ target/release/flowlog-compiler example/graph_analysis/reach.dl -F reach -o reach_bin -D -
-$ ./reach_bin -w 4
+cargo build --release -p flowlog-compiler
 ```
 
-Flag reference: [Compiler CLI](#compiler-cli). For incremental mode and the profiler, see <https://www.flowlog-rs.com/>.
-
-## System requirements
-
-FlowLog's performance and stability depend on a number of host and OS-level
-settings. For example, on Linux a large analysis can abort with `memory
-allocation of <N> bytes failed` even when memory is plentiful, because the
-allocator maps many memory regions and exhausts a low
-`vm.max_map_count`. Raising it resolves this:
-
-```console
-$ sudo sysctl -w vm.max_map_count=1048576
-```
-
-Before running, review the recommended host configuration in the setup guide:
-<https://www.flowlog-rs.com/tutorial/getting-started/system-config>.
-
-## Architecture
-
-A `.dl` program compiles through five stages; three side modules assist the planner and codegen:
-
-```text
-                                                   profiler
-                                                       ┊
-                                                       ↓
-.dl → parser → typechecker → stratifier → planner → codegen → executable
-                                             ↑
-                                             ┊
-                                    catalog · optimizer
-```
-
-**Pipeline**
-
-- **parser** — `.dl` → typed AST, each node source-located.
-- **typechecker** — resolves literal types (`1` → `int32`).
-- **stratifier** — groups rules into dependency-ordered strata; a stratum with a cycle recurses to fixpoint.
-- **planner** — lowers rules to a Differential Dataflow plan, sharing sub-plans to reuse arrangements.
-- **codegen** — emits the plan as Timely + Differential Dataflow Rust.
-
-**Side modules**
-
-- **catalog** — per-rule metadata for the planner (signatures, pushdown filters, range checks).
-- **optimizer** — cardinality-based join ordering and worst-case optimal joins (WIP).
-- **profiler** — runtime metrics from Timely / Differential Dataflow operators.
-
-**Crates**
-
-- **`flowlog-build`** — library; compile `.dl` to Rust from `build.rs`.
-- **`flowlog-compiler`** — CLI; compile `.dl` to a standalone executable.
-- **`flowlog-runtime`** — linked into output (interning, IO, sort/merge, incremental-txn state); not a direct dep.
-
-## Compiler CLI
+Run the 5-cycle comparison with an edge CSV and worker count:
 
 ```bash
-$ flowlog-compiler <PROGRAM> [OPTIONS]
+bash tmp/run_topcats_5cycle_compare.sh /path/to/facts 32
 ```
 
-`<PROGRAM>` is a path to a `.dl` file, or `all` / `--all` to compile every program in `example/`. Common options:
+The directory must contain the edge file selected by `FLOWLOG_EDGE_FILE`, or
+the default `wiki-topcats.csv`. The runner makes an `Arc.csv` symlink in its
+own temporary input directory.
 
-- `-F, --fact-dir <DIR>` — default directory for relative `.input` filenames; the executable can override it at runtime.
-- `-o <PATH>` — output executable path; defaults to the program stem (`reach.dl` → `./reach`).
-- `-D, --output-dir <DIR>` — default directory for `.output` files; `-` prints tuples to stdout. The executable can override it at runtime.
-- `-B, --build-dir <DIR>` — keep the generated Rust project in this directory for subsequent builds.
-- `-T, --target-dir <DIR>` — share Cargo artifacts across build directories; overrides `CARGO_TARGET_DIR`. Relative paths start at the compiler's working directory.
-- `--mode <MODE>` — `batch` (default) or `inc`.
-- `--str-intern` — intern string columns at load for faster joins and lower memory (off by default).
-- `-P, --profile` — collect execution statistics.
-- `-h, --help` — full help text.
+For the batch triangle comparison, point the environment at an edge file:
 
-## Testing
+```bash
+TRIANGLE_EDGE_FILE=/path/to/wiki-topcats.csv \
+TRIANGLE_WORKERS=32 \
+bash tmp/run_triangle_dogsdogsdogs_batch_compare.sh
+```
 
-A green oracle run is the definition of correct — see [`tests/README.md`](tests/README.md) for per-suite contracts and recipes.
+Each runner writes a fresh timestamped result directory under `tmp/` and does
+not overwrite the checked-in records.
 
-### vs Soufflé — DOOP
+## Files intentionally kept local
 
-On DOOP **default** points-to analysis (`doop/default.dl`) across all 20 [DaCapo](https://www.dacapobench.org/) programs at **32 threads** (FlowLog `-w 32`, Soufflé `-j 32`). The Soufflé program is the same `default.dl` of identical rules and join order; all 20 produce **identical `VarPointsTo`**.
+The original working directory also contains raw graph inputs, input symlinks,
+generated compiler build trees, Cargo target directories, and generated
+executables. They are preserved locally but are ignored on this branch:
 
-<p align="center">
-  <img src="docs/doop-time.png" alt="DOOP run time — FlowLog vs Soufflé" width="820"/>
-</p>
+- `tmp/as-skitter-undirected.csv` (about 298 MB)
+- `tmp/wiki-topcats-70pct-seed0.csv` (about 207 MB)
+- `tmp/wiki-topcats-30pct-seed0.csv` (about 39 MB)
+- generated `build/`, `target/`, `program`, and `triangle` outputs
 
-**Run time** (run only; one-off compile excluded) — FlowLog is faster on **20/20**, geomean **3.62×** (range 1.41–6.07×).
-
-<p align="center">
-  <img src="docs/doop-memory.png" alt="DOOP peak memory — FlowLog vs Soufflé" width="820"/>
-</p>
-
-**Peak memory** — Soufflé is leaner: Soufflé/FlowLog geomean **0.43×** (FlowLog trades memory for speed).
-
-Benchmark suite: [`flowlog-bench`](https://github.com/flowlog-rs/flowlog-bench).
-
-## Publication
-
-> **FlowLog: Efficient and Extensible Datalog via Incrementality**  
-> Hangdong Zhao, Zhenghong Yu, Srinag Rao, Simon Frisk, Zhiwei Fan, Paraschos Koutris  
-> VLDB 2026, Boston
-
-- **Paper** — [PVLDB Vol. 19](https://www.vldb.org/pvldb/vol19/p361-zhao.pdf)
-- **Artifacts** — [flowlog-rs/vldb26-artifact](https://github.com/flowlog-rs/vldb26-artifact)
-
-## Contributing
-
-Issues and pull requests are welcome. Target `main` and sign off your commits with `git commit -s`. PRs must pass CI before merge. See the [contributor guide](AGENTS.md) and [release process](docs/dev/releases.md).
-
-**Let's make Datalog fast — and incremental.**
+The first two files exceed GitHub's 100 MB per-file limit. Keeping generated
+artifacts out of the branch also makes the checked-in scripts and source files
+the authoritative way to reproduce a run. Nothing in the local experiment
+directory is deleted by this branch.

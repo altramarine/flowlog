@@ -1,0 +1,24 @@
+Command terminated by signal 6
+	Command being timed: "/users/yp_wei/flowlog/tmp/skitter-5cycle-compare/20260928T065222Z/baseline/program -F /users/yp_wei/flowlog/tmp/skitter-5cycle-compare/20260928T065222Z/input -w 32"
+	User time (seconds): 2208.81
+	System time (seconds): 534.87
+	Percent of CPU this job got: 1786%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:33.61
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 232251904
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 24021178
+	Voluntary context switches: 14589097
+	Involuntary context switches: 3887
+	Swaps: 0
+	File system inputs: 291520
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

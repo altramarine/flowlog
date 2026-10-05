@@ -1,0 +1,15 @@
+12.999481ms:	Dataflow assembled
+memory allocation of 8192 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+memory allocation of memory allocation of 8192memory allocation of  bytes failed
+skipping backtrace printing to avoid potential recursion
+memory allocation of 81928192 bytes failed
+skipping backtrace printing to avoid potential recursion
+ bytes failed
+skipping backtrace printing to avoid potential recursion
+memory allocation of 8192memory allocation of 8192 bytes failed
+skipping backtrace printing to avoid potential recursion
+ bytes failed
+skipping backtrace printing to avoid potential recursion
+8192 bytes failed
+skipping backtrace printing to avoid potential recursion

@@ -1,0 +1,22 @@
+   Compiling unicode-width v0.2.2
+   Compiling bytemuck v1.25.2
+   Compiling timely_container v0.31.0
+   Compiling either v1.18.0
+   Compiling byteorder v1.5.0
+   Compiling timely_bytes v0.31.0
+   Compiling fnv v1.0.7
+   Compiling serde_core v1.0.229
+   Compiling timely_logging v0.31.0
+   Compiling getopts v0.2.24
+   Compiling itertools v0.14.0
+   Compiling serde v1.0.229
+   Compiling smallvec v1.16.2
+   Compiling bincode v1.3.3
+   Compiling columnar v0.13.2
+   Compiling columnation v0.1.2
+   Compiling timely_communication v0.31.0
+   Compiling timely v0.31.0
+   Compiling differential-dataflow v0.25.1
+   Compiling differential-dogs3 v0.25.1 (/tmp/differential-dogs3-0.25.1/differential-dogs3-0.25.1)
+   Compiling dogsdogsdogs-triangle-topcats v0.1.0 (/users/yp_wei/flowlog/tmp/dogsdogsdogs-triangle-topcats)
+    Finished `release` profile [optimized] target(s) in 17.80s

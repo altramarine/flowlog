@@ -1,0 +1,15 @@
+.decl R(src:int32,dst:int32)
+.input R(IO="file",filename="wiki-topcats.csv",delimiter=",")
+.decl dB(b:int32,n:int64)
+.decl dC(a:int32,n:int64)
+.decl best1(a:int32,b:int32)
+.decl best2(a:int32,b:int32)
+.decl Tri(a:int32,b:int32,c:int32)
+.printsize Tri
+
+dB(b,count(c)) :- R(b,c).
+dC(a,count(c)) :- R(c,a).
+best1(a,b) :- R(a,b), dB(b,db), dC(a,da), db <= da.
+best2(a,b) :- R(a,b), dB(b,db), dC(a,da), db > da.
+Tri(a,b,c) :- best1(a,b), R(b,c), R(c,a).
+Tri(a,b,c) :- best2(a,b), R(c,a), R(b,c).

@@ -1,0 +1,20 @@
+.decl Arc(x: int32, y: int32)
+.input Arc(IO="file", filename="Arc.csv", delimiter=",")
+
+.decl R1__R2__R3(a: int32, b: int32, c: int32, d: int32)
+R1__R2__R3(a, b, c, d) :-
+    Arc(a, b),
+    Arc(b, c),
+    Arc(c, d).
+
+.decl R4__R5(d: int32, e: int32, a: int32)
+R4__R5(d, e, a) :-
+    Arc(d, e),
+    Arc(e, a).
+
+.decl Result(a: int32, b: int32, c: int32, d: int32, e: int32)
+Result(a, b, c, d, e) :-
+    R1__R2__R3(a, b, c, d),
+    R4__R5(d, e, a).
+
+.printsize Result

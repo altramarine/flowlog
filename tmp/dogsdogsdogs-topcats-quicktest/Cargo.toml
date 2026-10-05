@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "dogsdogsdogs-topcats-quicktest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+differential-dataflow = "0.25.1"
+differential-dogs3 = { path = "/tmp/differential-dogs3-0.25.1/differential-dogs3-0.25.1" }
+timely = "0.31"

@@ -1,0 +1,231 @@
+// --------------------------------------------------------------------------
+//  worst-case-optimal split plan with numbered shared contexts
+//
+//    0: split R1
+//    ├─1: split R3
+//    │  ├─2: split R2
+//    │  │  ├─3: leaf {R1__R2__R5, R3__R4}
+//    │  │  └─4: leaf {R1__R5, R2__R3__R4}
+//    │  └─5: split R4
+//    │     ├─6: leaf {R1__R4__R5, R2__R3}
+//    │     └─7: leaf {R1__R5, R2__R3__R4}
+//    └─8: split R4
+//       ├─9: split R1__R2
+//       │  ├─10: leaf {R1__R2__R3, R4__R5}
+//       │  └─11: leaf {R1__R2__R3__R4__R5}
+//       └─12: split R5
+//          ├─13: leaf {R1__R2, R3__R4__R5}
+//          └─14: leaf {R1__R2__R5, R3__R4}
+//
+// A relation created before a split is named with that internal node's index
+// and is shared by all descendants. A relation created after a split carries
+// the leaf index. Thus leaves 3 and 4 share nodes 0, 1, and 2's context; they
+// do not independently materialize the prefix transformations.
+// --------------------------------------------------------------------------
+
+.decl Arc(x: int32, y: int32)
+.input Arc(IO="file", filename="Arc.csv", delimiter=",")
+
+// Shared base statistics.
+.decl OutDeg(x: int32, k: int32)
+.decl InDeg(x: int32, k: int32)
+OutDeg(x, count(y)) :- Arc(x, y).
+InDeg(y, count(x)) :- Arc(x, y).
+
+// ===========================================================================
+// Node 0: split R1. These two branch contexts are shared by all descendants.
+// ===========================================================================
+
+.decl R1__R2__0(a: int32, b: int32, c: int32)
+R1__R2__0(a, b, c) :-
+    Arc(a, b),
+    OutDeg(b, deg0),
+    InDeg(a, deg1),
+    deg0 <= deg1,
+    Arc(b, c).
+
+.decl R1__R5__0(a: int32, b: int32, e: int32)
+R1__R5__0(a, b, e) :-
+    Arc(a, b),
+    OutDeg(b, deg0),
+    InDeg(a, deg1),
+    deg1 < deg0,
+    Arc(e, a).
+
+// ===========================================================================
+// Node 1: split R3. Both node 2 and node 5 use these contexts.
+// ===========================================================================
+
+.decl R3__R4__1(c: int32, d: int32, e: int32)
+R3__R4__1(c, d, e) :-
+    Arc(c, d),
+    OutDeg(d, deg0),
+    InDeg(c, deg1),
+    deg0 <= deg1,
+    Arc(d, e).
+
+.decl R2__R3__1(b: int32, c: int32, d: int32)
+R2__R3__1(b, c, d) :-
+    Arc(c, d),
+    OutDeg(d, deg0),
+    InDeg(c, deg1),
+    deg1 < deg0,
+    Arc(b, c).
+
+// ===========================================================================
+// Node 2: split R2, with leaves 3 and 4 sharing nodes 0 and 1 above.
+// ===========================================================================
+
+.decl R1__R2__R5__3(a: int32, b: int32, c: int32, e: int32)
+R1__R2__R5__3(a, b, c, e) :-
+    Arc(b, c),
+    OutDeg(c, deg0),
+    InDeg(b, deg1),
+    deg1 < deg0,
+    R1__R5__0(a, b, e).
+
+.decl R2__R3__R4__4(b: int32, c: int32, d: int32, e: int32)
+R2__R3__R4__4(b, c, d, e) :-
+    Arc(b, c),
+    OutDeg(c, deg0),
+    InDeg(b, deg1),
+    deg0 <= deg1,
+    R3__R4__1(c, d, e).
+
+.decl Leaf__3(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__3(a, b, c, d, e) :-
+    R1__R2__R5__3(a, b, c, e),
+    R3__R4__1(c, d, e).
+
+.decl Leaf__4(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__4(a, b, c, d, e) :-
+    R1__R5__0(a, b, e),
+    R2__R3__R4__4(b, c, d, e).
+
+// ===========================================================================
+// Node 5: split R4, with leaves 6 and 7 sharing nodes 0 and 1 above.
+// ===========================================================================
+
+.decl R1__R4__R5__6(a: int32, b: int32, d: int32, e: int32)
+R1__R4__R5__6(a, b, d, e) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg0 <= deg1,
+    R1__R5__0(a, b, e).
+
+.decl R2__R3__R4__7(b: int32, c: int32, d: int32, e: int32)
+R2__R3__R4__7(b, c, d, e) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg1 < deg0,
+    R2__R3__1(b, c, d).
+
+.decl Leaf__6(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__6(a, b, c, d, e) :-
+    R1__R4__R5__6(a, b, d, e),
+    R2__R3__1(b, c, d).
+
+.decl Leaf__7(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__7(a, b, c, d, e) :-
+    R1__R5__0(a, b, e),
+    R2__R3__R4__7(b, c, d, e).
+
+// ===========================================================================
+// Node 8: split R4. Its descendants share the root R1 context.
+// ===========================================================================
+
+.decl R3__R4__8(c: int32, d: int32, e: int32)
+R3__R4__8(c, d, e) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg1 < deg0,
+    Arc(c, d).
+
+// ===========================================================================
+// Node 9: split R1__R2. Leaves 10 and 11 share node 9's R4__R5 context.
+// ===========================================================================
+
+.decl R4__R5__9(d: int32, e: int32, a: int32)
+R4__R5__9(d, e, a) :-
+    Arc(d, e),
+    OutDeg(e, deg0),
+    InDeg(d, deg1),
+    deg0 <= deg1,
+    Arc(e, a).
+
+.decl R1__R2__R3__10(a: int32, b: int32, c: int32, d: int32)
+R1__R2__R3__10(a, b, c, d) :-
+    R1__R2__0(a, b, c),
+    OutDeg(c, deg0),
+    InDeg(a, deg1),
+    deg0 <= deg1,
+    Arc(c, d).
+
+.decl Leaf__10(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__10(a, b, c, d, e) :-
+    R1__R2__R3__10(a, b, c, d),
+    R4__R5__9(d, e, a).
+
+// ===========================================================================
+// Node 11: full five-edge leaf, sharing node 9's contexts.
+// ===========================================================================
+
+.decl R1__R2__R3__R4__R5__11(a: int32, b: int32, c: int32, d: int32, e: int32)
+R1__R2__R3__R4__R5__11(a, b, c, d, e) :-
+    R1__R2__0(a, b, c),
+    OutDeg(c, deg0),
+    InDeg(a, deg1),
+    deg1 < deg0,
+    R4__R5__9(d, e, a),
+    Arc(c, d).
+
+.decl Leaf__11(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__11(a, b, c, d, e) :-
+    R1__R2__R3__R4__R5__11(a, b, c, d, e).
+
+// ===========================================================================
+// Node 12: split R5. Leaves 13 and 14 share node 8's R3__R4 context.
+// ===========================================================================
+
+.decl R3__R4__R5__13(c: int32, d: int32, e: int32, a: int32)
+R3__R4__R5__13(c, d, e, a) :-
+    Arc(e, a),
+    OutDeg(a, deg0),
+    InDeg(e, deg1),
+    deg1 < deg0,
+    R3__R4__8(c, d, e).
+
+.decl R1__R2__R5__14(a: int32, b: int32, c: int32, e: int32)
+R1__R2__R5__14(a, b, c, e) :-
+    Arc(e, a),
+    OutDeg(a, deg0),
+    InDeg(e, deg1),
+    deg0 <= deg1,
+    R1__R2__0(a, b, c).
+
+.decl Leaf__13(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__13(a, b, c, d, e) :-
+    R1__R2__0(a, b, c),
+    R3__R4__R5__13(c, d, e, a).
+
+.decl Leaf__14(a: int32, b: int32, c: int32, d: int32, e: int32)
+Leaf__14(a, b, c, d, e) :-
+    R1__R2__R5__14(a, b, c, e),
+    R3__R4__8(c, d, e).
+
+// Only the final output is intentionally unioned. All branch-local leaves
+// remain separate until this point.
+.decl Result(a: int32, b: int32, c: int32, d: int32, e: int32)
+Result(a, b, c, d, e) :- Leaf__3(a, b, c, d, e).
+Result(a, b, c, d, e) :- Leaf__4(a, b, c, d, e).
+Result(a, b, c, d, e) :- Leaf__6(a, b, c, d, e).
+Result(a, b, c, d, e) :- Leaf__7(a, b, c, d, e).
+Result(a, b, c, d, e) :- Leaf__10(a, b, c, d, e).
+Result(a, b, c, d, e) :- Leaf__11(a, b, c, d, e).
+Result(a, b, c, d, e) :- Leaf__13(a, b, c, d, e).
+Result(a, b, c, d, e) :- Leaf__14(a, b, c, d, e).
+
+.printsize Result
