@@ -98,14 +98,23 @@ impl RulePlanner {
             let input_producer_indices = self.producer_indices(input_fp)?;
             let mut input_producer_output_fp = 0u64;
             for &input_producer_index in &input_producer_indices {
-                // Short-lived borrow to check if producer is a neg join
                 let producer_tx = &self.transformation_infos[input_producer_index];
-                if producer_tx.is_neg_join() && !predicates.compare_exprs.is_empty() {
-                    // We always apply possible comparisons before neg joins, so it is impossible
-                    // to fuse a map with a neg join producer if there are any comparisons.
-                    return Err(PlanError::internal(
-                        "fuse_map: impossible fusion of map with neg join producer",
-                    ));
+                // Prepare applies equalities, then comparisons, before any
+                // semijoin or antijoin (rules 1 and 2 above), and a join
+                // takes no equality and an antijoin no comparison. A map
+                // carrying one and reading a join means a later pass broke
+                // that order; naming both sides points at the pass.
+                let equality = !predicates.const_eq.is_empty() || !predicates.var_eq.is_empty();
+                let comparison = !predicates.compare_exprs.is_empty();
+                let is_map = matches!(producer_tx, TransformationInfo::KVToKV { .. });
+                if (equality && !is_map) || (comparison && producer_tx.is_neg_join()) {
+                    return Err(PlanError::internal(format!(
+                        "fuse_map: {fused_map_name} filters with {predicates} but reads {} {}; \
+                         an equality applies before any join or antijoin, a comparison before \
+                         any antijoin",
+                        producer_tx.operation_name(),
+                        producer_tx.output_name(),
+                    )));
                 }
 
                 trace!(
@@ -529,6 +538,9 @@ impl RulePlanner {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::ArithmeticPos;
+    use crate::planner::KeyValueLayout;
+    use crate::planner::PlanError;
     use crate::planner::TransformationInfo;
     use crate::test_harness::rule_planner;
 
@@ -598,6 +610,79 @@ mod tests {
         assert_eq!(
             computed_keys, 2,
             "each side keys on its computed expression"
+        );
+    }
+
+    /// A constant filter reading an antijoin is an internal error naming
+    /// the filter and the antijoin, where the merge itself would fail
+    /// deeper with no hint of the pass that broke the order. Prepare
+    /// applies filters before any join, so the shape is built by hand: a
+    /// second application of `!U` between the two filters on `P`, where
+    /// pushdown once placed its copy (issue #409).
+    #[test]
+    fn a_filter_reading_an_antijoin_is_an_internal_error() {
+        let (mut planner, mut catalog) = rule_planner(
+            ".decl P(x: symbol, t: symbol, k: symbol, d: symbol)\n.input P\n\
+             .decl A(x: symbol)\n.input A\n\
+             .decl U(x: symbol, k: symbol, v: symbol)\n.input U\n\
+             .decl V(x: symbol)\n.output V\n\
+             V(x) :- P(x, \"a\", \"b\", _), A(x), !U(x, _, _).\n",
+        );
+        planner.prepare(&mut catalog).expect("prepare");
+        let originals = catalog.original_atom_fingerprints();
+
+        let (copy, target_fp, reader) = {
+            let infos = &planner.transformation_infos;
+            let filters: Vec<usize> = (0..infos.len())
+                .filter(|&index| {
+                    matches!(
+                        &infos[index],
+                        TransformationInfo::KVToKV { predicates, .. } if !predicates.const_eq.is_empty()
+                    )
+                })
+                .collect();
+            let [target, reader] = filters[..] else {
+                panic!("two constant filters on P");
+            };
+            let fold = infos
+                .iter()
+                .find(|tx| matches!(tx, TransformationInfo::AntiJoinToKV { .. }))
+                .expect("the fold of !U");
+            let (filter_layout, _) = fold.input_kv_layout();
+            let (reader_layout, _) = infos[reader].input_kv_layout();
+            let positions: Vec<ArithmeticPos> = reader_layout
+                .key()
+                .iter()
+                .chain(reader_layout.value())
+                .cloned()
+                .collect();
+            let copy = TransformationInfo::anti_join_to_kv(
+                fold.input_info_fp().0,
+                fold.input_name().0.to_string(),
+                infos[target].output_info_fp(),
+                infos[target].output_name().to_string(),
+                "copy".to_string(),
+                filter_layout.clone(),
+                KeyValueLayout::new(vec![positions[0].clone()], positions[1..].to_vec()),
+                KeyValueLayout::new(Vec::new(), positions),
+            );
+            (copy, infos[target].output_info_fp(), reader)
+        };
+        let copy_fp = copy.output_info_fp();
+        planner.transformation_infos.push(copy);
+        planner.transformation_infos[reader].update_input_fp(copy_fp, target_fp);
+        planner
+            .rebuild_producer_consumer(originals)
+            .expect("rebuild");
+
+        let err = planner
+            .fuse(originals)
+            .expect_err("a filter reads an antijoin");
+        assert!(matches!(err, PlanError::Internal(_)), "got {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("fuse_map") && message.contains("[AntiJoin -> KV]"),
+            "got {message}"
         );
     }
 }

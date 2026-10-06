@@ -1,0 +1,37 @@
+// ============================================================================
+// Suite   : pushdown_onto_filters
+// Feature : folded filters pushed onto atoms that two constant filters narrow
+// Covers  : a copy onto a joined atom lands above both of its filters, on
+//           the edge into the join; an atom that is itself a folded filter
+//           takes no copy, however many filters narrow it (issue #409: a
+//           copy between the two filters left the second one reading a
+//           join, which fuse cannot merge a filter into)
+// ============================================================================
+
+// `E` folds into `B` by arity, so `C` joins `D` without it; the copy of
+// `E` lands on `C`, above its two constant filters.
+.decl C(x: int32, t: symbol, k: symbol, z: int32, v: int32)
+.input C(IO="file", filename="C.csv", delimiter=",")
+.decl D(z: int32, w: int32)
+.input D(IO="file", filename="D.csv", delimiter=",")
+.decl B(x: int32, y: int32)
+.input B(IO="file", filename="B.csv", delimiter=",")
+.decl E(x: int32)
+.input E(IO="file", filename="E.csv", delimiter=",")
+
+.decl W(x: int32, y: int32, z: int32, w: int32, v: int32)
+W(x, y, z, w, v) :- C(x, "c", "d", z, v), D(z, w), B(x, y), E(x).
+.output W
+
+// `P` folds into `A` as a filter after its two constants, and `!U` folds
+// onto that; `!U` takes no copy onto `P` and applies once.
+.decl P(x: symbol, t: symbol, k: symbol, d: symbol)
+.input P(IO="file", filename="P.csv", delimiter=",")
+.decl A(x: symbol)
+.input A(IO="file", filename="A.csv", delimiter=",")
+.decl U(x: symbol, k: symbol, v: symbol)
+.input U(IO="file", filename="U.csv", delimiter=",")
+
+.decl V(x: symbol)
+V(x) :- P(x, "a", "b", _), A(x), !U(x, _, _).
+.output V
