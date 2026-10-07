@@ -5,6 +5,12 @@
 //!
 //! Core logic relies on optimizer to give the index of the two atoms to join.
 
+use std::collections::BTreeSet;
+
+use flowlog_parser::Atom;
+use flowlog_parser::AtomArg;
+use flowlog_parser::FlowLogRule;
+use flowlog_parser::Predicate;
 use tracing::trace;
 
 use super::RulePlanner;
@@ -22,10 +28,40 @@ use crate::planner::TransformationInfo;
 // Core Planning
 // =========================================================================
 impl RulePlanner {
-    /// This is the main entry point for the rule planning process. It performs a join
-    /// between two positive atoms and then applies optimization transformations in a
-    /// fixed-point loop until no more optimizations can be applied.
+    /// Joins the requested pair unless a GYO ear determines the remaining join order.
     pub(crate) fn core(
+        &mut self,
+        catalog: &mut Catalog,
+        join_tuple_index: (usize, usize),
+    ) -> Result<(), PlanError> {
+        if let Some((ear_index, separator)) = Self::next_gyo_ear(catalog)? {
+            return self.plan_gyo_ear(catalog, ear_index, &separator);
+        }
+        self.join_and_reduce(catalog, join_tuple_index)
+    }
+
+    /// Plans the reduced rule, then adds the selected ear as the final join.
+    fn plan_gyo_ear(
+        &mut self,
+        catalog: &mut Catalog,
+        ear_index: usize,
+        separator: &BTreeSet<String>,
+    ) -> Result<(), PlanError> {
+        let ear = Self::reduce_gyo_ear(catalog, ear_index, separator)?;
+
+        // Removing an ear can expose a semijoin, so reach the ordinary
+        // preparation fixed point before considering the reduced core.
+        self.prepare(catalog)?;
+        while !catalog.is_planned() {
+            self.core(catalog, (0, 1))?;
+        }
+
+        Self::restore_gyo_ear(catalog, ear)?;
+        self.join_and_reduce(catalog, (0, 1))
+    }
+
+    /// Performs one join and reaches the subsequent semijoin fixed point.
+    fn join_and_reduce(
         &mut self,
         catalog: &mut Catalog,
         join_tuple_index: (usize, usize),
@@ -292,6 +328,113 @@ impl RulePlanner {
         )?;
         Ok(())
     }
+
+    /// Returns the first positive atom whose shared variables fit in one other atom.
+    fn next_gyo_ear(catalog: &Catalog) -> Result<Option<(usize, BTreeSet<String>)>, PlanError> {
+        if !catalog.filters().is_empty() {
+            return Ok(None);
+        }
+
+        let positive_atoms = catalog
+            .rule()
+            .rhs()
+            .iter()
+            .filter_map(|predicate| match predicate {
+                Predicate::PositiveAtom(atom) => Some(atom),
+                Predicate::NegativeAtom(_) | Predicate::Compare(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if positive_atoms.len() != catalog.rule().rhs().len() || positive_atoms.len() < 3 {
+            return Ok(None);
+        }
+
+        let variables = |index: usize| {
+            positive_atoms[index]
+                .arguments()
+                .iter()
+                .filter_map(|argument| match argument {
+                    AtomArg::Var(variable) => Some(variable.clone()),
+                    AtomArg::Const(_) | AtomArg::Placeholder => None,
+                })
+                .collect::<BTreeSet<_>>()
+        };
+
+        for ear_index in 0..positive_atoms.len() {
+            if !catalog
+                .original_atom_fingerprints()
+                .contains(&positive_atoms[ear_index].fingerprint())
+            {
+                continue;
+            }
+            let ear_variables = variables(ear_index);
+            let other_variables = positive_atoms
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| index != ear_index)
+                .flat_map(|(_, atom)| {
+                    atom.arguments()
+                        .iter()
+                        .filter_map(|argument| match argument {
+                            AtomArg::Var(variable) => Some(variable.clone()),
+                            AtomArg::Const(_) | AtomArg::Placeholder => None,
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            let separator = ear_variables
+                .intersection(&other_variables)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+
+            if positive_atoms
+                .iter()
+                .enumerate()
+                .any(|(index, _)| index != ear_index && separator.is_subset(&variables(index)))
+            {
+                return Ok(Some((ear_index, separator)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Replaces an ear with the projection used to semijoin its separator.
+    fn reduce_gyo_ear(
+        catalog: &mut Catalog,
+        ear_index: usize,
+        separator: &BTreeSet<String>,
+    ) -> Result<Predicate, PlanError> {
+        let rhs_index = catalog.positive_atom_rhs_id(ear_index)?;
+        let mut rhs = catalog.rule().rhs().to_vec();
+        let ear = rhs[rhs_index].clone();
+        let Predicate::PositiveAtom(atom) = &ear else {
+            return Err(PlanError::internal(format!(
+                "GYO ear {ear_index} is not a positive atom in {}",
+                catalog.rule()
+            )));
+        };
+        let arguments = atom
+            .arguments()
+            .iter()
+            .map(|argument| match argument {
+                AtomArg::Var(variable) if separator.contains(variable) => argument.clone(),
+                AtomArg::Const(_) => argument.clone(),
+                AtomArg::Var(_) | AtomArg::Placeholder => AtomArg::Placeholder,
+            })
+            .collect();
+        rhs[rhs_index] =
+            Predicate::PositiveAtom(Atom::new(atom.name(), arguments, atom.fingerprint()));
+        let reduced_rule = FlowLogRule::new(catalog.rule().head().clone(), rhs);
+        catalog.update_rule(&reduced_rule)?;
+        Ok(ear)
+    }
+
+    /// Restores an ear after its reduced rule is completely planned.
+    fn restore_gyo_ear(catalog: &mut Catalog, ear: Predicate) -> Result<(), PlanError> {
+        let mut rhs = catalog.rule().rhs().to_vec();
+        rhs.push(ear);
+        let restored_rule = FlowLogRule::new(catalog.rule().head().clone(), rhs);
+        catalog.update_rule(&restored_rule)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +538,36 @@ mod tests {
             catalog.is_planned(),
             "catalog should be flagged planned after a complete 2-atom join"
         );
+    }
+
+    #[test]
+    fn gyo_ear_joins_after_the_reduced_core() {
+        let (mut planner, mut catalog) = test_setup(
+            ".decl R(x: int32, y: int32, z: int32)\n.input R\n\
+             .decl S(x: int32, y: int32, w: int32)\n.input S\n\
+             .decl T(x: int32, y: int32, u: int32)\n.input T\n\
+             .decl Out(x: int32, y: int32, z: int32, w: int32, u: int32)\n.output Out\n\
+             Out(x, y, z, w, u) :- R(x, y, z), S(x, y, w), T(x, y, u).\n",
+        );
+        planner.prepare(&mut catalog).expect("prepare");
+
+        planner.core(&mut catalog, (0, 1)).expect("core");
+
+        let right_inputs = planner
+            .transformation_infos()
+            .iter()
+            .filter(|tx| matches!(tx, TransformationInfo::JoinToKV { .. }))
+            .map(|tx| tx.input_name().1.map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            right_inputs,
+            vec![
+                Some("s".to_string()),
+                Some("t".to_string()),
+                Some("r".to_string()),
+            ]
+        );
+        assert!(catalog.is_planned());
     }
 
     /// Shared body for the equi-join fusion tests: plan the single rule of
