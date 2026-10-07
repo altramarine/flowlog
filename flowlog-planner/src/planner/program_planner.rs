@@ -102,8 +102,8 @@ mod tests {
         Dyck(x, y) :- One(x, z), Dyck(z, w), One(w, y).\n\
         Dyck(x, y) :- Dyck(x, z), Dyck(z, y).\n";
 
-    /// The recursive Dyck stratum arranges `zero` and `one` exactly as the
-    /// base stratum before it did; it reads those arrangements instead.
+    /// The recursive Dyck stratum reuses the base arrangements and adds
+    /// key-only projections for its deferred ears.
     #[test]
     fn dyck_reads_the_base_stratum_arrangements_instead_of_rebuilding_them() {
         let pp = ProgramPlanner::analyze(DYCK_SRC);
@@ -120,9 +120,8 @@ mod tests {
             }
         }
 
-        // Twelve prelude collections as planned, eight once the recursive
-        // stratum reads the four arrangements the base stratum built.
-        assert_eq!(owner.len(), 8, "expected 8 prelude transformations");
+        // The two ear projections supplement the eight shared collections.
+        assert_eq!(owner.len(), 10, "expected 10 prelude transformations");
     }
 
     /// `Q`'s join of `R` and `S` holds the rows `P` computed one stratum

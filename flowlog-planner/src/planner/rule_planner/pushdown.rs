@@ -602,12 +602,12 @@ mod tests {
     use super::super::common::test_setup;
     use super::*;
 
-    /// Plans `src` through prepare, core in body order, and pushdown.
+    /// Plans `src` in body order so pushdown tests have a fixed input plan.
     fn plan(src: &str) -> RulePlanner {
         let (mut planner, mut catalog) = test_setup(src);
         planner.prepare(&mut catalog).unwrap();
         while !catalog.is_planned() {
-            planner.core(&mut catalog, (0, 1)).unwrap();
+            planner.join_and_reduce(&mut catalog, (0, 1)).unwrap();
         }
         planner.pushdown(&catalog).unwrap();
         planner

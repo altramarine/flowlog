@@ -1,0 +1,16 @@
+.decl A(a: int32, x: int32)
+.decl B(a: int32, b: int32)
+.decl D(b: int32, c: int32)
+.decl C(c: int32, y: int32)
+A(1, 2).
+A(10, 11).
+B(1, 3).
+B(10, 30).
+D(3, 4).
+D(30, 40).
+C(4, 5).
+C(40, 50).
+
+.decl Out(x: int32, y: int32)
+Out(x, y) :- A(a, x), B(a, b), D(b, c), C(c, y).
+.output Out

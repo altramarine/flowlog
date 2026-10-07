@@ -1,0 +1,11 @@
+.decl Arc(src: int32, dest: int32)
+Arc(1, 2).
+Arc(1, 3).
+Arc(2, 4).
+Arc(3, 5).
+Arc(10, 11).
+
+.decl Sg(src: int32, dest: int32)
+Sg(x, y) :- Arc(a, x), Arc(a, y), x != y.
+Sg(x, y) :- Arc(a, x), Sg(a, b), Arc(b, y).
+.output Sg

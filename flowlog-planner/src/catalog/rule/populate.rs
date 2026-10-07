@@ -255,8 +255,8 @@ impl Catalog {
         Ok(())
     }
 
-    /// Records projectable variables used by one body predicate and absent
-    /// from the head.
+    /// Records variables used by one active predicate, absent from the head
+    /// and every deferred relation.
     fn populate_unused_arguments(&mut self) {
         let mut variable_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut count_variable = |variable: &String| {
@@ -270,6 +270,19 @@ impl Catalog {
             .chain(&self.comparison_variables);
         for variables in predicate_variables {
             variables.iter().for_each(&mut count_variable);
+        }
+
+        // Deferred relations still need their join variables when expanded.
+        for atom in &self.deferred_relations {
+            let variables = atom
+                .arguments()
+                .iter()
+                .filter_map(|argument| match argument {
+                    AtomArg::Var(variable) => Some(variable),
+                    AtomArg::Const(_) | AtomArg::Placeholder => None,
+                })
+                .collect::<BTreeSet<_>>();
+            variables.into_iter().for_each(&mut count_variable);
         }
 
         let head_variables = self.head_variables();

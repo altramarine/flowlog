@@ -28,7 +28,7 @@ use crate::planner::TransformationInfo;
 // Core Planning
 // =========================================================================
 impl RulePlanner {
-    /// Joins the requested pair unless a GYO ear determines the remaining join order.
+    /// Joins the requested pair or defers GYO ears until the core is planned.
     pub(crate) fn core(
         &mut self,
         catalog: &mut Catalog,
@@ -40,28 +40,33 @@ impl RulePlanner {
         self.join_and_reduce(catalog, join_tuple_index)
     }
 
-    /// Plans the reduced rule, then adds the selected ear as the final join.
+    /// Reduces ears before expanding all postponed relations into the core.
     fn plan_gyo_ear(
         &mut self,
         catalog: &mut Catalog,
         ear_index: usize,
         separator: &BTreeSet<String>,
     ) -> Result<(), PlanError> {
-        let ear = Self::reduce_gyo_ear(catalog, ear_index, separator)?;
-
-        // Removing an ear can expose a semijoin, so reach the ordinary
-        // preparation fixed point before considering the reduced core.
+        Self::reduce_gyo_ear(catalog, ear_index, separator)?;
         self.prepare(catalog)?;
+        while let Some((ear_index, separator)) = Self::next_gyo_ear(catalog)? {
+            Self::reduce_gyo_ear(catalog, ear_index, &separator)?;
+            self.prepare(catalog)?;
+        }
         while !catalog.is_planned() {
-            self.core(catalog, (0, 1))?;
+            self.join_and_reduce(catalog, (0, 1))?;
         }
 
-        Self::restore_gyo_ear(catalog, ear)?;
-        self.join_and_reduce(catalog, (0, 1))
+        catalog.restore_deferred_relations()?;
+        self.prepare(catalog)?;
+        while !catalog.is_planned() {
+            self.join_and_reduce(catalog, (0, 1))?;
+        }
+        Ok(())
     }
 
     /// Performs one join and reaches the subsequent semijoin fixed point.
-    fn join_and_reduce(
+    pub(super) fn join_and_reduce(
         &mut self,
         catalog: &mut Catalog,
         join_tuple_index: (usize, usize),
@@ -329,7 +334,7 @@ impl RulePlanner {
         Ok(())
     }
 
-    /// Returns the first positive atom whose shared variables fit in one other atom.
+    /// Returns the last original atom whose shared variables fit in another atom.
     fn next_gyo_ear(catalog: &Catalog) -> Result<Option<(usize, BTreeSet<String>)>, PlanError> {
         if !catalog.filters().is_empty() {
             return Ok(None);
@@ -359,7 +364,7 @@ impl RulePlanner {
                 .collect::<BTreeSet<_>>()
         };
 
-        for ear_index in 0..positive_atoms.len() {
+        for ear_index in (0..positive_atoms.len()).rev() {
             if !catalog
                 .original_atom_fingerprints()
                 .contains(&positive_atoms[ear_index].fingerprint())
@@ -401,7 +406,7 @@ impl RulePlanner {
         catalog: &mut Catalog,
         ear_index: usize,
         separator: &BTreeSet<String>,
-    ) -> Result<Predicate, PlanError> {
+    ) -> Result<(), PlanError> {
         let rhs_index = catalog.positive_atom_rhs_id(ear_index)?;
         let mut rhs = catalog.rule().rhs().to_vec();
         let ear = rhs[rhs_index].clone();
@@ -423,16 +428,8 @@ impl RulePlanner {
         rhs[rhs_index] =
             Predicate::PositiveAtom(Atom::new(atom.name(), arguments, atom.fingerprint()));
         let reduced_rule = FlowLogRule::new(catalog.rule().head().clone(), rhs);
+        catalog.defer_relation(atom.clone());
         catalog.update_rule(&reduced_rule)?;
-        Ok(ear)
-    }
-
-    /// Restores an ear after its reduced rule is completely planned.
-    fn restore_gyo_ear(catalog: &mut Catalog, ear: Predicate) -> Result<(), PlanError> {
-        let mut rhs = catalog.rule().rhs().to_vec();
-        rhs.push(ear);
-        let restored_rule = FlowLogRule::new(catalog.rule().head().clone(), rhs);
-        catalog.update_rule(&restored_rule)?;
         Ok(())
     }
 }
@@ -441,6 +438,37 @@ impl RulePlanner {
 mod tests {
     use super::super::common::test_setup;
     use super::*;
+
+    #[rstest::rstest]
+    #[case("Out(x, y) :- A(a, x), B(a, b), C(b, y).")]
+    #[case("Out(x, y) :- A(a, x), B(a, b), D(b, c), C(c, y).")]
+    fn deferred_ears_preserve_join_keys(#[case] rule: &str) {
+        let source = format!(
+            ".decl A(a: int32, x: int32)\n\
+             .decl B(a: int32, b: int32)\n\
+             .decl C(b: int32, y: int32)\n\
+             .decl D(b: int32, c: int32)\n\
+             .decl Out(x: int32, y: int32)\n\
+             .input A\n.input B\n.input C\n.input D\n\
+             .output Out\n{rule}\n"
+        );
+        let (mut planner, mut catalog) = test_setup(&source);
+        planner.prepare(&mut catalog).expect("prepare");
+        planner.core(&mut catalog, (0, 1)).expect("core");
+
+        assert!(catalog.is_planned());
+        let joins = planner
+            .transformation_infos()
+            .iter()
+            .filter(|step| matches!(step, TransformationInfo::JoinToKV { .. }))
+            .collect::<Vec<_>>();
+        assert!(!joins.is_empty());
+        for join in joins {
+            let (left, right) = join.input_kv_layout();
+            assert_eq!(left.key().len(), 1);
+            assert_eq!(right.expect("right input").key().len(), 1);
+        }
+    }
 
     /// The single `JoinToKV` a planned 2-atom join must contain.
     fn find_join(planner: &RulePlanner) -> &TransformationInfo {
@@ -541,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn gyo_ear_joins_after_the_reduced_core() {
+    fn last_gyo_ear_joins_after_the_reduced_core() {
         let (mut planner, mut catalog) = test_setup(
             ".decl R(x: int32, y: int32, z: int32)\n.input R\n\
              .decl S(x: int32, y: int32, w: int32)\n.input S\n\
@@ -562,9 +590,9 @@ mod tests {
         assert_eq!(
             right_inputs,
             vec![
+                Some("r".to_string()),
                 Some("s".to_string()),
                 Some("t".to_string()),
-                Some("r".to_string()),
             ]
         );
         assert!(catalog.is_planned());

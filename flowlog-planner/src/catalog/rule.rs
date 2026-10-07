@@ -8,6 +8,7 @@ use std::fmt;
 use flowlog_common::SECTION_BAR;
 use flowlog_common::SUBSECTION_BAR;
 use flowlog_parser::Arithmetic;
+use flowlog_parser::Atom;
 use flowlog_parser::ComparisonExpr;
 use flowlog_parser::ComparisonOperator;
 use flowlog_parser::FlowLogRule;
@@ -52,6 +53,9 @@ fn metadata_at<'a, T>(
 pub(crate) struct Catalog {
     /// The rule this metadata describes, including catalog rewrites.
     rule: FlowLogRule,
+
+    /// Relations postponed until the reduced body has been planned.
+    deferred_relations: Vec<Atom>,
 
     /// Variable name at each variable-bearing argument position.
     argument_variables: BTreeMap<AtomArgumentSignature, String>,
@@ -103,8 +107,8 @@ pub(crate) struct Catalog {
     /// Head fingerprint as first catalogued.
     original_head_fingerprint: u64,
 
-    /// Projectable argument positions whose variable is used by exactly
-    /// one body predicate and not in the head. Grouped by atom.
+    /// Projectable positions used by one active predicate and absent from
+    /// the head and deferred relations, grouped by atom.
     unused_arguments_per_atom: BTreeMap<AtomSignature, Vec<AtomArgumentSignature>>,
 }
 
@@ -116,6 +120,7 @@ impl Catalog {
     fn with_empty_metadata(rule: &FlowLogRule) -> Self {
         Self {
             rule: rule.clone(),
+            deferred_relations: Vec::new(),
             argument_variables: BTreeMap::new(),
             positive_argument_presence: BTreeMap::new(),
             original_atom_fingerprints: BTreeSet::new(),
@@ -178,10 +183,34 @@ impl Catalog {
     /// internal error if derived metadata is inconsistent.
     pub(crate) fn update_rule(&mut self, rule: &FlowLogRule) -> Result<(), CatalogError> {
         let mut replacement = Self::with_empty_metadata(rule);
+        replacement.deferred_relations = self.deferred_relations.clone();
         replacement.populate_all_metadata()?;
         replacement.original_atom_fingerprints = self.original_atom_fingerprints.clone();
         replacement.original_head_fingerprint = self.original_head_fingerprint;
         *self = replacement;
+        Ok(())
+    }
+
+    /// Saves a relation whose variables must survive reduced-body planning.
+    pub(crate) fn defer_relation(&mut self, atom: Atom) {
+        self.deferred_relations.push(atom);
+    }
+
+    /// Restores postponed relations in reverse removal order.
+    pub(crate) fn restore_deferred_relations(&mut self) -> Result<(), CatalogError> {
+        let mut rhs = self.rule.rhs().to_vec();
+        rhs.extend(
+            self.deferred_relations
+                .iter()
+                .rev()
+                .cloned()
+                .map(Predicate::PositiveAtom),
+        );
+        let restored_rule = FlowLogRule::new(self.rule.head().clone(), rhs);
+        let mut restored = Self::from_rule(&restored_rule)?;
+        restored.original_atom_fingerprints = self.original_atom_fingerprints.clone();
+        restored.original_head_fingerprint = self.original_head_fingerprint;
+        *self = restored;
         Ok(())
     }
 }
@@ -691,7 +720,7 @@ impl Catalog {
 
     // --- Plan logic ---
 
-    /// Returns `true` once every atom has been folded into the plan.
+    /// Returns `true` once every active atom has been folded into the plan.
     pub(crate) fn is_planned(&self) -> bool {
         self.positive_atom_fingerprints.len() == 1
             && self.negative_atom_fingerprints.is_empty()
