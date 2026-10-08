@@ -129,12 +129,20 @@ impl PlanGraph {
         output_variable_name: String,
         fingerprint: u64,
         is_key_only: bool,
+        projection_dedup: Option<bool>,
     ) {
+        let dedup = projection_dedup.map_or(0, |recursive| {
+            if recursive {
+                steps::dedup_recursive(self.mode)
+            } else {
+                steps::DEDUP_NONRECURSIVE
+            }
+        });
         self.push_node(
             name,
             input_variable_names,
             Some(output_variable_name),
-            1 + steps::arrange(is_key_only),
+            1 + dedup + steps::arrange(is_key_only),
             Some(fingerprint),
         );
     }
