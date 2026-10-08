@@ -240,6 +240,9 @@ impl CodeGen {
                     && flow.value().is_empty()
                     && is_identity_row_projection(flow.key(), input.arity().1);
 
+                let needs_dedup =
+                    projection_loses_columns(flow.key(), flow.value(), input.arity(), true);
+
                 with_plan_graph(plan_graph, |plan_graph| {
                     let name = transformation_name;
                     let inputs = vec![inp.to_string()];
@@ -255,6 +258,7 @@ impl CodeGen {
                             arr,
                             fp,
                             output.is_k_only(),
+                            needs_dedup.then_some(recursive),
                         );
                     }
                 });
@@ -273,6 +277,12 @@ impl CodeGen {
                     }
                 };
 
+                let projection_dedup = needs_dedup.then(|| {
+                    quote! {
+                        let #out = ::flowlog_runtime::operators::flowlog_dedup(#out);
+                    }
+                });
+
                 // Arrangement registration
                 let arrange_stmt = self.register_arrangement(
                     arranged_map,
@@ -283,6 +293,7 @@ impl CodeGen {
 
                 Ok(quote! {
                     #transformation
+                    #projection_dedup
                     #arrange_stmt
                 })
             }
@@ -378,6 +389,9 @@ impl CodeGen {
                 let cst_pred = build_kv_constraints_predicate(flow.constraints(), si)?;
                 let pred = combine_predicates(vec![cmp_pred, cst_pred]);
 
+                let needs_dedup =
+                    projection_loses_columns(flow.key(), flow.value(), input.arity(), false);
+
                 with_plan_graph(plan_graph, |plan_graph| {
                     plan_graph.map_join_arrange_operator(
                         transformation_name,
@@ -385,6 +399,7 @@ impl CodeGen {
                         format!("{}_arr", out),
                         output.fingerprint(),
                         output.is_k_only(),
+                        needs_dedup.then_some(recursive),
                     );
                 });
                 let (kv_param_k, kv_param_v) = compute_kv_param_tokens(
@@ -412,6 +427,12 @@ impl CodeGen {
                     );
                 };
 
+                let projection_dedup = needs_dedup.then(|| {
+                    quote! {
+                        let #out = ::flowlog_runtime::operators::flowlog_dedup(#out);
+                    }
+                });
+
                 // Arrangement registration
                 let arrange_stmt = self.register_arrangement(
                     arranged_map,
@@ -422,6 +443,7 @@ impl CodeGen {
 
                 Ok(quote! {
                     #transformation
+                    #projection_dedup
                     #arrange_stmt
                 })
             }
@@ -506,6 +528,7 @@ impl CodeGen {
                         format!("{}_arr", out),
                         output.fingerprint(),
                         output.is_k_only(),
+                        None,
                     );
                 });
 
@@ -728,6 +751,28 @@ fn flat_map_body_tokens(pred: Option<TokenStream>, out: TokenStream) -> TokenStr
     }
 }
 
+/// Returns `true` if an input column is not preserved as a bare output column.
+/// Reordering or duplicating retained columns does not require normalization.
+fn projection_loses_columns(
+    key: &[ArithmeticArgument],
+    value: &[ArithmeticArgument],
+    input_arity: (usize, usize),
+    row_input: bool,
+) -> bool {
+    let preserves = |is_key, index| {
+        key.iter().chain(value).any(|arg| {
+            arg.rest().is_empty()
+                && matches!(
+                    arg.init(),
+                    FactorArgument::Var(TransformationArgument::KV((k, i)))
+                        if *i == index && (row_input || *k == is_key)
+                )
+        })
+    };
+    (0..input_arity.0).any(|i| !preserves(true, i))
+        || (0..input_arity.1).any(|i| !preserves(false, i))
+}
+
 /// `true` iff `args` reproduce every one of the input row's `row_arity` columns exactly once, in
 /// order, as a bare variable -- no arithmetic, cast, constant, reorder, or dropped/added column.
 fn is_identity_row_projection(args: &[ArithmeticArgument], row_arity: usize) -> bool {
@@ -759,8 +804,10 @@ mod identity_projection_tests {
     use flowlog_planner::planner::ArithmeticArgument;
     use flowlog_planner::planner::FactorArgument;
     use flowlog_planner::planner::TransformationArgument;
+    use rstest::rstest;
 
     use super::is_identity_row_projection;
+    use super::projection_loses_columns;
 
     /// A bare column reference `KV((is_key, idx))` with no arithmetic tail.
     fn col(is_key: bool, idx: usize) -> ArithmeticArgument {
@@ -768,6 +815,26 @@ mod identity_projection_tests {
             init: FactorArgument::Var(TransformationArgument::KV((is_key, idx))),
             rest: Vec::new(),
         }
+    }
+
+    /// The codegen-only predicate is private; these cases pin its column contract.
+    #[rstest]
+    #[case(vec![col(false, 0), col(false, 1)], vec![], (0, 3), true, true)]
+    #[case(vec![col(false, 0), col(false, 1)], vec![], (0, 2), true, false)]
+    #[case(vec![col(false, 1), col(false, 0)], vec![], (0, 2), true, false)]
+    #[case(vec![col(false, 0), col(false, 0)], vec![], (0, 2), true, true)]
+    #[case(vec![col(true, 0)], vec![], (1, 1), false, true)]
+    #[case(vec![col(false, 0)], vec![col(true, 0)], (1, 1), false, false)]
+    #[case(vec![col(true, 0)], vec![col(false, 0)], (1, 2), false, true)]
+    #[case(vec![], vec![], (0, 0), true, false)]
+    fn projection_normalization_tracks_lost_columns(
+        #[case] key: Vec<ArithmeticArgument>,
+        #[case] value: Vec<ArithmeticArgument>,
+        #[case] arity: (usize, usize),
+        #[case] row: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(projection_loses_columns(&key, &value, arity, row), expected);
     }
 
     #[test]
