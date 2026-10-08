@@ -3,39 +3,29 @@
 //! All non-stdlib references must resolve against the dependencies declared
 //! in [`crate::scaffold::render_cargo_toml`]; keep the two in sync.
 
-use flowlog_build::Features;
 use flowlog_common::Config;
-use flowlog_common::ExecutionMode;
+use flowlog_parser::Program;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-pub(crate) fn gen_imports(config: &Config, features: &Features) -> TokenStream {
-    let inc = config.mode() == ExecutionMode::Inc;
+pub(crate) fn gen_imports(config: &Config, program: &Program) -> TokenStream {
     let prof = config.profiling_enabled();
-    let f = features;
+    let incremental = program.is_incremental();
 
     let mut out = Vec::<TokenStream>::new();
 
     out.push(quote! {
-        // Mechanically generated dataflow routinely leaves intermediate
-        // collection bindings unused, e.g. a relation declared (with `.input`
-        // or inline facts) yet never referenced by any rule body, or a derived
-        // collection whose only consumer is an output drain through a separate
-        // handle. These are valid Datalog (Souffle accepts them); relax just the
-        // unused-variable lint on the generated binary while `-Dwarnings` keeps
-        // every other lint class fatal.
-        #![allow(unused_variables)]
-
-        // Relation names may legally begin with `_` (DOOP's `basic._MethodLookup_*`);
-        // joined with their component prefix they synthesize binding idents with
-        // consecutive underscores, which `non_snake_case` rejects.
+        // joined with their component prefix they synthesize binding idents
+        // with consecutive underscores, which `non_snake_case` rejects.
+        // Every other warning is a generator bug, and `-Dwarnings` keeps it
+        // fatal (docs/dev/code.md rule 8).
         #![allow(non_snake_case)]
 
         mod relation;
         use relation::*;
     });
 
-    if inc {
+    if incremental {
         out.push(quote! {
             mod cmd;
             mod prompt;
@@ -47,9 +37,8 @@ pub(crate) fn gen_imports(config: &Config, features: &Features) -> TokenStream {
     }
 
     out.push(std_imports(prof));
-    out.push(dd_core_imports(f));
 
-    if inc {
+    if incremental {
         out.push(quote! { use timely::dataflow::operators::probe::Handle as ProbeHandle; });
     }
     if prof {
@@ -65,10 +54,7 @@ pub(crate) fn gen_imports(config: &Config, features: &Features) -> TokenStream {
         static GLOBAL: MiMalloc = MiMalloc;
     });
 
-    if f.ordered_float() {
-        out.push(quote! { use ordered_float::OrderedFloat; });
-    }
-    if f.udf() {
+    if !program.udfs().is_empty() {
         out.push(quote! {
             #[allow(dead_code)]
             mod udf;
@@ -88,17 +74,4 @@ fn std_imports(prof: bool) -> TokenStream {
     } else {
         quote! { use std::time::Instant; }
     }
-}
-
-fn dd_core_imports(f: &Features) -> TokenStream {
-    let mut out = Vec::new();
-    if f.dd_input() {
-        out.push(quote! { use differential_dataflow::input::Input; });
-    }
-    if f.recursive() {
-        out.push(quote! {
-            use differential_dataflow::operators::iterate::Variable;
-        });
-    }
-    quote! { #(#out)* }
 }

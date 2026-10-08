@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Lib-mode runner crate synthesis — shared between fixture (L1) and oracle
+# Lib-mode runner crate synthesis; shared between fixture (L1) and oracle
 # (L2) test runners. The library API has no file I/O, so each test driver
 # synthesizes a small Rust crate that uses `flowlog-build` to compile the
 # .dl into a typed engine, parses CSVs, drives the engine, and writes
@@ -9,9 +9,9 @@
 # Caller contract:
 #
 #   # Required: path to the (persistent) runner crate directory.
-#   LIB_RUNNER_DIR="${ROOT_DIR}/target/e2e-lib/runner"
+#   LIB_RUNNER_DIR="${ROOT_DIR}/target/e2e/slot-0/lib/crate"
 #
-#   # Optional Builder knobs — unset = default (off). Set to 1 to enable.
+#   # Optional Builder knobs; unset = default (off). Set to 1 to enable.
 #   LIB_RUNNER_STR_INTERN=1
 #
 #   source "${ROOT_DIR}/tests/lib/runner_synth.sh"
@@ -22,7 +22,7 @@
 #   (cd "$LIB_RUNNER_DIR" && cargo run --release)
 #
 # Runtime: the synthesized `main.rs` reads `WORKERS` from the environment
-# and passes it to `BatchEngine::new(n)`. Unset → workers=1.
+# and passes it to `BatchEngine::new(n)`. Unset -> workers=1.
 
 [[ -n "${FLOWLOG_LIB_RUNNER_SYNTH_SH_LOADED:-}" ]] && return 0
 FLOWLOG_LIB_RUNNER_SYNTH_SH_LOADED=1
@@ -97,7 +97,7 @@ parse_output_relations() {
 
 # Map a lowered output-relation name (as produced by `parse_output_relations`,
 # e.g. `reach`, `a·p`) back to its on-disk output filename in the new
-# Soufflé-compat shape: the case-preserved `.output`/`.printsize` token with
+# Souffle-compat shape: the case-preserved `.output`/`.printsize` token with
 # literal dots, plus a `.csv` extension (e.g. `Reach.csv`, `a.P.csv`). Mirrors
 # the compiler's `<RawName>.csv` convention so lib-mode output matches the
 # `expected/` files. Falls back to `<lower>.csv` if no directive is found.
@@ -108,7 +108,7 @@ output_filename_for() {
         [[ -f "$f" ]] || continue
         while IFS= read -r raw; do
             [[ -n "$raw" ]] || continue
-            # Lowercase + dot→· to match parse_output_relations' awk form.
+            # Lowercase + dot->· to match parse_output_relations' awk form.
             rawlower="${raw,,}"; rawlower="${rawlower//./·}"
             if [[ "$rawlower" == "$want_lower" ]]; then
                 printf '%s.csv' "$raw"
@@ -139,8 +139,8 @@ _parse_decl() {
     local dl_file="$1"
     local rel="$2"
     local mode="$3"
-    # Names that went through the dot→· rename refer to component-instance
-    # relations (`a.P` from `.init a = Pair<…>`). The user `.decl` lives
+    # Names that went through the dot->· rename refer to component-instance
+    # relations (`a.P` from `.init a = Pair<...>`). The user `.decl` lives
     # inside the `.comp` body under its bare suffix (`P`), so fall back to
     # matching the post-`·` tail when the full name has no direct decl.
     local search_names=("$rel")
@@ -209,7 +209,7 @@ tuple_field_types() {
                 | tr '\n' ' '
             return 0
         fi
-        # Bare alias RHS — follow it.
+        # Bare alias RHS; follow it.
         local rhs
         rhs=$(echo "$line" | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//')
         [[ "$rhs" == *'<:'* || -z "$rhs" ]] && return 1
@@ -239,7 +239,7 @@ fmt_col_expr() {
             fi
             j=$((j + 1))
         done
-        # A 1-tuple needs the trailing comma — `(e0,)` — matching the source
+        # A 1-tuple needs the trailing comma; `(e0,)`; matching the source
         # grammar and the binary serializer.
         (( j == 1 )) && inner_fmt+=","
         printf 'format!("(%s)", %s)' "$inner_fmt" "$inner_args"
@@ -249,7 +249,7 @@ fmt_col_expr() {
 }
 
 # Rust type for a column's declared `dltype`, resolving `.type` tuple aliases to
-# the nested Rust tuple they lower to (e.g. `P = (a:int32, b:int32)` → `(i32,
+# the nested Rust tuple they lower to (e.g. `P = (a:int32, b:int32)` -> `(i32,
 # i32)`), recursing for nesting and emitting the 1-tuple trailing comma.
 # Primitives fall back to `dl_to_rust_type`.
 dl_to_rust_type_deep() {
@@ -307,7 +307,6 @@ EOF
 #
 # Honors optional globals:
 #   LIB_RUNNER_STR_INTERN=1  -> Builder::string_intern(true)
-#   LIB_RUNNER_INC=1         -> Builder::mode(ExecutionMode::Inc)
 #
 # `test_dir` may be empty when called for a warm-up build.
 write_build_rs() {
@@ -327,13 +326,6 @@ write_build_rs() {
 
     local knob_setters=""
     (( ${LIB_RUNNER_STR_INTERN:-0} )) && knob_setters+=$'        .string_intern(true)\n'
-
-    # Defaults to `Batch`; `LIB_RUNNER_INC` toggles to incremental.
-    local mode_setter=""
-    if (( ${LIB_RUNNER_INC:-0} )); then
-        mode_setter=$'        .mode(flowlog_build::ExecutionMode::Inc)\n'
-    fi
-    knob_setters+="$mode_setter"
 
     local udf_setter=""
     (( has_udf )) && udf_setter=$'        .udf_file("udf.rs")\n'
@@ -401,7 +393,7 @@ gen_csv_loader() {
     pascal=$(pascal_case "$lower_name")
 
     # Build a positional tuple literal: `(parse_col_0, parse_col_1, ...)`.
-    # The user-facing type `rel::<Pascal>` is a tuple alias now — no named
+    # The user-facing type `rel::<Pascal>` is a tuple alias now; no named
     # fields, no keyword-collision concerns.
     local tuple_exprs=""
     local first=1
@@ -455,7 +447,7 @@ EOF
 #
 # The caller controls the output filename via `output_basename` (3rd arg).
 # Unit mode passes the lowercase stem (`reach`); complex mode may pass the
-# same or a suffixed form — the complex verifier accepts either.
+# same or a suffixed form; the complex verifier accepts either.
 #
 # For nullary IDBs (no fields), writes `True` if the bool is set.
 gen_writer_block() {
@@ -484,14 +476,14 @@ EOF
         return 0
     fi
 
-    # `.output Rel(delimiter="…")` controls the column separator; the raw
+    # `.output Rel(delimiter="...")` controls the column separator; the raw
     # value uses the same escape spelling Rust's `format!` accepts (`\t`,
     # `\n`, `\r`, `\\`), so it's spliced directly into the format string.
     local delim
     delim=$(output_delimiter_for "$dl_file" "$lower_name")
 
     # Per-column formatting. The user-facing relation is a positional tuple
-    # (`r.0, r.1, …`); a column whose declared type is itself a `.type` tuple is
+    # (`r.0, r.1, ...`); a column whose declared type is itself a `.type` tuple is
     # rendered in the FlowLog tuple form `(a, b)` (via `fmt_col_expr`) so the
     # output matches the binary-mode serializer. Other columns use `Display`.
     local typed_fields
@@ -524,7 +516,7 @@ EOF
 # Synthesize a fresh main.rs that drives the engine for the current test.
 #
 # Reads `WORKERS` from the environment and passes it to
-# `BatchEngine::new(n)`. Unset or unparseable → 1 worker.
+# `BatchEngine::new(n)`. Unset or unparseable -> 1 worker.
 write_main_rs() {
     local dl_file="$1"
     local main_rs="${LIB_RUNNER_DIR}/src/main.rs"
@@ -541,9 +533,9 @@ write_main_rs() {
         load_calls+=$(gen_csv_loader "$dl_file" "$rel" "$(basename "$csv_path")")$'\n'
     done < <(parse_input_relations "$dl_file")
 
-    # Output writers — one block per `.output` relation. File name
+    # Output writers; one block per `.output` relation. File name
     # is the case-preserved `<RawName>.csv` (via output_filename_for), matching
-    # the compiler's Soufflé-compat convention that compare_expected_outputs
+    # the compiler's Souffle-compat convention that compare_expected_outputs
     # diffs against.
     local writer_blocks=""
     local lower
@@ -556,7 +548,7 @@ write_main_rs() {
     done < <(parse_output_relations "$dl_file")
 
     cat > "$main_rs" <<EOF
-// Auto-generated by tests/lib/runner_synth.sh — do not edit.
+// Auto-generated by tests/lib/runner_synth.sh; do not edit.
 #![allow(unused_imports, dead_code)]
 
 pub mod prog {
@@ -636,7 +628,7 @@ _inc_fmt_and_accessors() {
     typed_fields=$(parse_decl_typed_fields "$dl_file" "$rel")
     for pair in $typed_fields; do
         dltype="${pair#*:}"
-        # Tuple columns render via `fmt_col_expr` (→ `(a, b)`); scalars use
+        # Tuple columns render via `fmt_col_expr` (-> `(a, b)`); scalars use
         # `Display`. Base is the per-row tuple binding `t`.
         expr=$(fmt_col_expr "$dl_file" "t.${i}" "$dltype")
         if (( first )); then
@@ -649,7 +641,8 @@ _inc_fmt_and_accessors() {
     printf '%s|%s' "$fmt" "$accessors"
 }
 
-# Match arm for `put <rel> ...` on a non-nullary relation.
+# Match arm for `insert <rel> <tuple>` / `delete <rel> <tuple>` on a
+# relation of positive arity.
 _inc_put_arm_nonnullary() {
     local dl_file="$1" rel="$2"
     local typed_fields arity=0 parse_lines=""
@@ -679,35 +672,50 @@ _inc_put_arm_nonnullary() {
                         let v: ${tuple_ty} = (
 ${parse_lines}
                         );
-                        if diff > 0 {
+                        if insert {
                             engine.insert_${rel}(vec![v]);
-                        } else if diff < 0 {
+                        } else {
                             engine.remove_${rel}(vec![v]);
                         }
                     }
 EOF
 }
 
-# Match arm for `put <rel> True|False` on a nullary relation. `diff` is
-# ignored — presence is carried entirely by the True/False token.
+# Match arm for `insert <rel>` / `delete <rel>` on a nullary relation,
+# whose tuple is empty.
 _inc_put_arm_nullary() {
     local rel="$1"
     cat <<EOF
                     "${rel}" => {
-                        let s = tuple_str.trim().to_ascii_lowercase();
-                        if s == "true" {
+                        if insert {
                             engine.set_${rel}();
-                        } else if s == "false" {
-                            engine.unset_${rel}();
                         } else {
-                            eprintln!("nullary ${rel} expects True/False, got: {}", tuple_str);
+                            engine.unset_${rel}();
                         }
                     }
 EOF
 }
 
-# Match arm for `file <rel> <path>`. Nullary relations don't support file
-# ingestion in the binary, so we mirror that by emitting an eprintln.
+# Match arm for `insert <rel> @<path>` / `delete <rel> @<path>` on a
+# nullary relation: every row decodes as the fact, as in the binary, so a
+# file with any row asserts or retracts it once.
+_inc_file_arm_nullary() {
+    local rel="$1"
+    cat <<EOF
+                    "${rel}" => {
+                        if content.lines().any(|l| !l.trim().is_empty()) {
+                            if insert {
+                                engine.set_${rel}();
+                            } else {
+                                engine.unset_${rel}();
+                            }
+                        }
+                    }
+EOF
+}
+
+# Match arm for `insert <rel> @<path>` / `delete <rel> @<path>` on a
+# relation of positive arity.
 _inc_file_arm_nonnullary() {
     local dl_file="$1" rel="$2"
     local typed_fields arity=0 parse_lines=""
@@ -739,22 +747,56 @@ ${parse_lines}
                                 )
                             })
                             .collect();
-                        if diff > 0 {
+                        if insert {
                             engine.insert_${rel}(items);
-                        } else if diff < 0 {
+                        } else {
                             engine.remove_${rel}(items);
                         }
                     }
 EOF
 }
 
-_inc_file_arm_nullary() {
+# Match arm for any command on a static relation. The engine offers a
+# static relation only an insert staged before the first commit, which the
+# preload epoch spends, so every command is refused as the binary refuses it.
+_inc_static_arm() {
     local rel="$1"
     cat <<EOF
                     "${rel}" => {
-                        eprintln!("nullary ${rel} does not support file ingestion");
+                        eprintln!("relation ${rel} is static and cannot change after its initial load");
                     }
 EOF
+}
+
+# Rewrites a mutable relation's command arm into an append relation's: the
+# engine offers an append relation no removal, so the arm's `delete` branch
+# becomes the refusal the binary gives it.
+_inc_append_only() {
+    local rel="$1"
+    sed -E "s/engine\.(remove|unset)_${rel}\(.*\);/eprintln!(\"relation ${rel} is append and accepts no deletion\");/"
+}
+
+# Prints the mutability `rel`'s `.decl` declares, `static`, `append`, or
+# `mutable`, across the .dl file and any sibling included files. An input
+# that declares nothing is static.
+relation_mutability() {
+    local dl_file="$1" rel="$2"
+    local name="${rel##*·}"
+    local decl
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        decl=$(grep -iE "^[[:space:]]*\.decl[[:space:]]+${name}[[:space:]]*\([^)]*\)" "$f" 2>/dev/null | head -1)
+        [[ -n "$decl" ]] || continue
+        if [[ "$decl" =~ \)[[:space:]]*append($|[^[:alnum:]_]) ]]; then
+            echo append
+        elif [[ "$decl" =~ \)[[:space:]]*mutable($|[^[:alnum:]_]) ]]; then
+            echo mutable
+        else
+            echo static
+        fi
+        return 0
+    done < <(all_dl_files "$dl_file")
+    echo static
 }
 
 # Per-output running-count state declaration. The engine returns raw
@@ -777,17 +819,17 @@ _inc_prev_decl() {
 #
 # Non-nullary: fold this commit's `Vec<(tuple, i32)>` into per-tuple
 # diffs, then for each tuple compare prev count vs new count to detect
-# set-membership transitions. Emit `<cols>\t+1` for 0→positive and
-# `<cols>\t-1` for positive→0; suppress count-only changes that don't
+# set-membership transitions. Emit `<cols>\t+1` for 0->positive and
+# `<cols>\t-1` for positive->0; suppress count-only changes that don't
 # cross zero. Sorted for deterministic output.
 #
-# Nullary: same logic over a single running count — write "True"
+# Nullary: same logic over a single running count; write "True"
 # whenever the unit fact crosses 0, matching binary-mode behavior.
 _inc_delta_block() {
     local dl_file="$1" rel="$2"
     local fields
     # Per-epoch delta filename base: `<RawName>` (case-preserved), so the
-    # written path is `<RawName>_t<N>.csv` — `_t<N>` injected before the
+    # written path is `<RawName>_t<N>.csv`; `_t<N>` injected before the
     # extension, matching the compiler's incremental output convention.
     local out_base
     out_base=$(output_filename_for "$dl_file" "$rel")
@@ -850,8 +892,8 @@ EOF
 }
 
 # Synthesize an inc-mode `main.rs`. Mirrors `write_main_rs` (batch) in
-# entry-point shape — reads WORKERS from env, stages inputs, and writes
-# to `output/` — but drives `Transaction`-scoped commits from
+# entry-point shape; reads WORKERS from env, stages inputs, and writes
+# to `output/`; but drives `Transaction`-scoped commits from
 # `commands.txt` and emits per-commit delta files keyed to the
 # commit index.
 write_main_rs_inc() {
@@ -860,17 +902,33 @@ write_main_rs_inc() {
 
     # Collect per-EDB arms + per-output prev state + delta blocks.
     local put_arms="" file_arms=""
-    local rel fields
+    local rel fields mutability
     while IFS= read -r rel; do
         [[ -n "$rel" ]] || continue
         fields=$(parse_decl_fields "$dl_file" "$rel") || true
-        if [[ -z "$fields" ]]; then
-            put_arms+=$(_inc_put_arm_nullary "$rel")$'\n'
-            file_arms+=$(_inc_file_arm_nullary "$rel")$'\n'
-        else
-            put_arms+=$(_inc_put_arm_nonnullary "$dl_file" "$rel")$'\n'
-            file_arms+=$(_inc_file_arm_nonnullary "$dl_file" "$rel")$'\n'
-        fi
+        mutability=$(relation_mutability "$dl_file" "$rel")
+        case "$mutability:$fields" in
+            static:*)
+                put_arms+=$(_inc_static_arm "$rel")$'\n'
+                file_arms+=$(_inc_static_arm "$rel")$'\n'
+                ;;
+            append:)
+                put_arms+=$(_inc_put_arm_nullary "$rel" | _inc_append_only "$rel")$'\n'
+                file_arms+=$(_inc_file_arm_nullary "$rel" | _inc_append_only "$rel")$'\n'
+                ;;
+            append:*)
+                put_arms+=$(_inc_put_arm_nonnullary "$dl_file" "$rel" | _inc_append_only "$rel")$'\n'
+                file_arms+=$(_inc_file_arm_nonnullary "$dl_file" "$rel" | _inc_append_only "$rel")$'\n'
+                ;;
+            mutable:)
+                put_arms+=$(_inc_put_arm_nullary "$rel")$'\n'
+                file_arms+=$(_inc_file_arm_nullary "$rel")$'\n'
+                ;;
+            mutable:*)
+                put_arms+=$(_inc_put_arm_nonnullary "$dl_file" "$rel")$'\n'
+                file_arms+=$(_inc_file_arm_nonnullary "$dl_file" "$rel")$'\n'
+                ;;
+        esac
     done < <(parse_input_relations "$dl_file")
 
     local prev_decls="" delta_blocks=""
@@ -880,18 +938,25 @@ write_main_rs_inc() {
         delta_blocks+=$(_inc_delta_block "$dl_file" "$rel")$'\n'
     done < <(parse_output_relations "$dl_file")
 
-    # Preload epoch — generated iff any EDB is declared `IO="file"`.
-    # Binary-mode runs an implicit preload commit before the first user
-    # command (loading the declared file into the engine) and surfaces
-    # the result as `<rel>_t1`. We mirror that here by injecting an
-    # explicit first-commit block so fixture commit indices stay aligned.
+    # Preload epoch; generated iff any EDB is declared `IO="file"` or the
+    # program has inline facts, the same condition as the binary's
+    # (`flowlog-compiler/src/io/input.rs`). Binary-mode runs an implicit
+    # preload commit before the first user command (loading the declared
+    # files and inline facts into the engine) and surfaces the result as
+    # `<rel>_t1`. We mirror that here by injecting an explicit
+    # first-commit block so fixture commit indices stay aligned; the
+    # engine applies inline facts at its first commit on its own.
     local preload_inserts="" preload_block=""
-    local any_file_backed=0
+    local needs_preload=0
+    # An inline fact is a whole line `Name(...).` with no `:-`.
+    if grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*\([^:]*\)[[:space:]]*\.[[:space:]]*$' "$dl_file"; then
+        needs_preload=1
+    fi
     while IFS= read -r rel; do
         [[ -n "$rel" ]] || continue
         local fname
         fname=$(file_backed_filename "$dl_file" "$rel") || continue
-        any_file_backed=1
+        needs_preload=1
         fields=$(parse_decl_fields "$dl_file" "$rel") || true
         [[ -z "$fields" ]] && continue  # nullary: file ingest not supported
         local typed_fields
@@ -929,7 +994,7 @@ EOF
 )$'\n'
     done < <(parse_input_relations "$dl_file")
 
-    if (( any_file_backed )); then
+    if (( needs_preload )); then
         preload_block=$(cat <<EOF
     {
         engine.begin();
@@ -943,7 +1008,7 @@ EOF
     fi
 
     cat > "$main_rs" <<EOF
-// Auto-generated by tests/lib/runner_synth.sh — do not edit.
+// Auto-generated by tests/lib/runner_synth.sh; do not edit.
 #![allow(unused_imports, dead_code, unused_mut, unused_variables)]
 
 pub mod prog {
@@ -985,35 +1050,28 @@ ${preload_block}
 ${delta_blocks}
             }
             "abort" | "rollback" => engine.abort(),
-            "put" => {
-                if parts.len() < 3 || parts.len() > 4 {
-                    eprintln!("put: bad args: {}", line);
+            "insert" | "delete" => {
+                let insert = head == "insert";
+                if parts.len() < 2 || parts.len() > 3 {
+                    eprintln!("{}: bad args: {}", head, line);
                     continue;
                 }
                 let rel = parts[1];
-                let tuple_str = parts[2];
-                let diff: i32 = parts
-                    .get(3)
-                    .map(|s| s.parse().expect("bad diff"))
-                    .unwrap_or(1);
-                match rel {
-${put_arms}                    _ => eprintln!("unknown rel: {}", rel),
-                }
-            }
-            "file" => {
-                if parts.len() < 3 || parts.len() > 4 {
-                    eprintln!("file: bad args: {}", line);
-                    continue;
-                }
-                let rel = parts[1];
-                let path_str = parts[2];
-                let diff: i32 = parts
-                    .get(3)
-                    .map(|s| s.parse().expect("bad diff"))
-                    .unwrap_or(1);
-                let content = std::fs::read_to_string(path_str).expect("read file");
-                match rel {
-${file_arms}                    _ => eprintln!("unknown rel: {}", rel),
+                // A nullary relation's fact is the empty tuple.
+                let arg = parts.get(2).copied().unwrap_or("");
+                match arg.strip_prefix('@') {
+                    Some(path) => {
+                        let content = std::fs::read_to_string(path).expect("read file");
+                        match rel {
+${file_arms}                            _ => eprintln!("unknown rel: {}", rel),
+                        }
+                    }
+                    None => {
+                        let tuple_str = arg;
+                        match rel {
+${put_arms}                            _ => eprintln!("unknown rel: {}", rel),
+                        }
+                    }
                 }
             }
             "quit" | "exit" | "q" => break,

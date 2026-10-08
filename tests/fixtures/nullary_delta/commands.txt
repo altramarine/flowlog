@@ -1,0 +1,9 @@
+begin
+insert score 1,80
+insert score 2,90
+insert score 3,100
+commit
+begin
+delete score 3,100
+commit
+quit

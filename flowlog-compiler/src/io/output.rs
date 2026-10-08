@@ -3,29 +3,39 @@
 //! Generated code selects paths or stdout and delegates collection and writing
 //! to runtime emitters. SQLite destinations share database transactions.
 
-use flowlog_common::ExecutionMode;
+use flowlog_codegen::output_emitter_ident;
 use flowlog_parser::OutputSink;
 use proc_macro2::Ident;
 use proc_macro2::TokenStream;
-use quote::format_ident;
 use quote::quote;
 
 use crate::Compiler;
 
+/// The output side of the generated `main`.
+#[derive(Debug)]
+pub(crate) struct Output {
+    /// Before the workers start: creates the output directory and the
+    /// state the writers keep across epochs.
+    pub initialize: TokenStream,
+    /// After the workers publish: writes every relation's rows and counts.
+    pub emit: TokenStream,
+}
+
 impl Compiler {
-    /// Stdout places each relation's rows before its count, in declaration
-    /// order. SQLite tables commit by database, text files emit concurrently,
-    /// then counts print in declaration order. Workers must publish their
-    /// results before this code runs.
-    pub(crate) fn gen_output(&self) -> (TokenStream, TokenStream) {
+    /// Returns the output fragments. Stdout places each relation's rows
+    /// before its count, in declaration order. SQLite tables commit by
+    /// database, text files emit concurrently, then counts print in
+    /// declaration order. Workers must publish their results before the
+    /// emit fragment runs.
+    pub(crate) fn gen_output(&self) -> Output {
         let mut file_emits = Vec::new();
         let mut stdout_emits = Vec::new();
         let mut size_emits = Vec::new();
         let mut sqlite_path_exprs = Vec::new();
         let mut sqlite_emit_arms = Vec::new();
-        let is_incremental = self.config.mode() == ExecutionMode::Inc;
+        let is_incremental = self.program.is_incremental();
         for relation in self.program.idbs() {
-            let emitter = format_ident!("buf_{}", relation.name());
+            let emitter = output_emitter_ident(relation.name());
             match relation.output_sink() {
                 Some(OutputSink::File { filename, .. }) => {
                     file_emits.push(self.gen_emit_file(&emitter, filename));
@@ -55,22 +65,36 @@ impl Compiler {
             }
         }
         if file_emits.is_empty() && sqlite_path_exprs.is_empty() {
-            return (quote! {}, quote! { #(#size_emits)* });
+            return Output {
+                initialize: quote! {},
+                emit: quote! { #(#size_emits)* },
+            };
         }
-        let initialize_output = if sqlite_path_exprs.is_empty() {
-            quote! {}
-        } else {
+        // The SQLite writer keeps per-database state across epochs, so it
+        // is set up once; the paths are a few joins and resolve where they
+        // are used, like the file paths.
+        let sqlite_writer = (!sqlite_path_exprs.is_empty()).then(|| {
             quote! {
-                let sqlite_paths = output_dir.as_ref()
-                    .map(|output_dir| vec![#(#sqlite_path_exprs),*])
-                    .unwrap_or_default();
                 let sqlite_writer = std::sync::Mutex::new(
                     ::flowlog_runtime::io::output::SqliteWriter::default(),
                 );
             }
+        });
+        let initialize = quote! {
+            if let Some(dir) = &output_dir {
+                if let Err(error) = std::fs::create_dir_all(dir) {
+                    eprintln!(
+                        "failed to create output directory '{}': {}",
+                        dir.display(), error,
+                    );
+                    std::process::exit(1);
+                }
+            }
+            #sqlite_writer
         };
         let emit_sqlite = (!sqlite_path_exprs.is_empty()).then(|| {
             quote! {
+                let sqlite_paths = vec![#(#sqlite_path_exprs),*];
                 let result = sqlite_writer.lock().expect("SQLite output state poisoned").write(
                     &sqlite_paths,
                     |index, transaction, reset| match index {
@@ -91,7 +115,7 @@ impl Compiler {
                 });
             }
         });
-        let emit_output = quote! {
+        let emit = quote! {
             if let Some(output_dir) = &output_dir {
                 #emit_sqlite
                 #emit_files
@@ -100,13 +124,14 @@ impl Compiler {
                 #(#stdout_emits)*
             }
         };
-        (initialize_output, emit_output)
+        Output { initialize, emit }
     }
 
     /// Resolves a filename against the runtime output directory, adding the
-    /// epoch suffix in incremental mode, and maps write errors to CLI failures.
+    /// epoch suffix in an incremental engine, and maps write errors to CLI
+    /// failures.
     fn gen_emit_file(&self, emitter: &Ident, filename: &str) -> TokenStream {
-        let is_incremental = self.config.mode() == ExecutionMode::Inc;
+        let is_incremental = self.program.is_incremental();
         let path = if is_incremental {
             let (stem, ext) = match filename.rfind('.') {
                 Some(idx) if idx > 0 => (&filename[..idx], &filename[idx..]),

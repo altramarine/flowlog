@@ -1,35 +1,42 @@
 //! Transaction state shared by every incremental driver.
 //!
 //! Both the binary-mode REPL (`flowlog-compiler`) and the library-mode
-//! engine (`flowlog-build`, incremental codegen) use the same
+//! engine (`flowlog-build`) use the same
 //! epoch-broadcast protocol: a driver writes a [`TxnState`] into
 //! `Arc<RwLock<_>>`, workers rendezvous on a [`std::sync::Barrier`] to
 //! read the snapshot, apply its `pending` ops, then rendezvous again to
 //! publish outputs. The only thing that differs between modes is who
-//! plays the driver — stdin for the binary, the host thread for the
+//! plays the driver: stdin for the binary, the host thread for the
 //! library.
 
 use std::path::PathBuf;
 
-/// Update multiplicity applied to a tuple. `+1` inserts, `-1` retracts;
-/// larger magnitudes scale the count in ring-valued semirings.
-pub type Diff = i32;
-
-/// A single tuple-level update queued inside a transaction.
+/// A single update queued inside a transaction: the rows it names are
+/// inserted into `rel` or deleted from it. A relation is a set, so a
+/// command never counts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxnOp {
-    /// Apply `diff` copies of `tuple` (serialized form) to `rel`.
-    Put {
-        rel: String,
-        tuple: String,
-        diff: Diff,
-    },
-    /// Apply `diff` copies of every row in `path` to `rel`.
-    File {
-        rel: String,
-        path: PathBuf,
-        diff: Diff,
-    },
+    Insert { rel: String, rows: Rows },
+    Delete { rel: String, rows: Rows },
+}
+
+impl TxnOp {
+    /// The relation the update names, as the command spelled it.
+    #[must_use]
+    pub fn rel(&self) -> &str {
+        match self {
+            Self::Insert { rel, .. } | Self::Delete { rel, .. } => rel,
+        }
+    }
+}
+
+/// The rows a command names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rows {
+    /// One tuple in serialized form; empty for a nullary relation's fact.
+    Tuple(String),
+    /// Every row of a file.
+    File(PathBuf),
 }
 
 /// What workers should do when they observe a new published [`TxnState`].
@@ -58,7 +65,7 @@ pub struct TxnState {
 }
 
 impl TxnState {
-    /// Clear the pending queue — used by drivers when starting or
+    /// Clear the pending queue, used by drivers when starting or
     /// aborting a transaction.
     pub fn clear_pending(&mut self) {
         self.pending.clear();
@@ -86,5 +93,26 @@ impl TxnState {
             action: TxnAction::Quit,
             pending: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both verbs name their relation as the command spelled it.
+    #[test]
+    fn an_update_names_its_relation_under_either_verb() {
+        let rows = Rows::Tuple("1,2".to_string());
+        let insert = TxnOp::Insert {
+            rel: "Edge".to_string(),
+            rows: rows.clone(),
+        };
+        let delete = TxnOp::Delete {
+            rel: "Edge".to_string(),
+            rows,
+        };
+        assert_eq!(insert.rel(), "Edge");
+        assert_eq!(delete.rel(), "Edge");
     }
 }

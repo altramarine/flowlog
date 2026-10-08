@@ -1,46 +1,46 @@
 //! Incremental assembly. Preload and interactive transactions share live
 //! workers, with barriers separating output emission from the next epoch.
 
-use flowlog_build::CodeParts;
+use flowlog_codegen::Skeleton;
 use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::io::input::Input;
+use crate::io::output::Output;
 
-/// Emits startup, preload, and an interactive loop over persistent workers.
-/// `emit_output` runs on worker 0 after every worker has published its results.
+/// Returns the incremental `main`: the runtime arguments and output setup,
+/// preload, and an interactive loop over persistent workers. The emit
+/// fragment runs on worker 0 after every worker has published its results.
 pub(super) fn gen_incremental_main(
-    parts: &CodeParts,
+    skeleton: &Skeleton,
     input: &Input,
-    startup: &TokenStream,
-    emit_output: &TokenStream,
+    runtime_args: &TokenStream,
+    output: &Output,
 ) -> TokenStream {
-    let CodeParts {
-        edb_decls,
-        handle_binding,
-        dataflow_return,
-        flows,
-        output_bufs,
-        output_buf_clones,
-        local_bufs,
-        inspectors,
-        flush,
-        size_cell_decls,
-        size_cell_clones,
-        profile_init,
-        metrics_write,
+    let Skeleton {
+        emitters,
+        emitter_captures,
+        worker_init,
+        dataflow,
         step_loop,
+        metrics_write,
+        publish,
         ..
-    } = parts;
+    } = skeleton;
     let Input {
         initialize_inputs,
         preload_inputs,
         ..
     } = input;
+    let Output {
+        initialize: initialize_output,
+        emit: emit_output,
+    } = output;
 
     quote! {
         fn main() {
-            #startup
+            #runtime_args
+            #initialize_output
 
             let shared_txn: Arc<RwLock<TxnState>> =
                 Arc::new(RwLock::new(TxnState::default()));
@@ -52,34 +52,20 @@ pub(super) fn gen_incremental_main(
             };
             let barrier = Arc::new(std::sync::Barrier::new(workers));
 
-            #(#output_bufs)*
-            #(#size_cell_decls)*
+            #emitters
 
             let timer = Instant::now();
             timely::execute(timely_config, {
                 let shared_txn = shared_txn.clone();
                 let barrier = barrier.clone();
-                #(#output_buf_clones)*
-                #(#size_cell_clones)*
+                #emitter_captures
 
                 move |worker| {
                     let index = worker.index();
 
-                    #profile_init
+                    #worker_init
 
-                    #(#local_bufs)*
-
-                    let #handle_binding =
-                        worker.dataflow::<Ts, _, _>(|scope| {
-                            #(#edb_decls)*
-                            #(#flows)*
-
-                            let mut probe = ProbeHandle::new();
-
-                            #(#inspectors)*
-
-                            #dataflow_return
-                        });
+                    #dataflow
 
                     #initialize_inputs
 
@@ -89,18 +75,10 @@ pub(super) fn gen_incremental_main(
 
                     fn apply_ops(inputs: &mut Inputs, ops: &[TxnOp]) {
                         for (ordinal, op) in ops.iter().enumerate() {
-                            let (rel, result) = match op {
-                                TxnOp::Put { rel, tuple, diff } => {
-                                    (rel, inputs.load_put(rel, tuple, ordinal, *diff))
-                                }
-                                TxnOp::File { rel, path, diff } => {
-                                    (rel, inputs.load_file(rel, path.as_path(), *diff))
-                                }
-                            };
-                            match result {
+                            match inputs.apply(op, ordinal) {
                                 Some(Ok(())) => {}
-                                Some(Err(error)) => eprintln!("[relation][{rel}] {error}"),
-                                None => eprintln!("unknown relation: '{rel}'"),
+                                Some(Err(error)) => eprintln!("[relation][{}] {error}", op.rel()),
+                                None => eprintln!("unknown relation: '{}'", op.rel()),
                             }
                         }
                     }
@@ -114,9 +92,7 @@ pub(super) fn gen_incremental_main(
 
                     let mut last_epoch_seen: u32 = 0;
 
-                    // -------------------------------
-                    // Worker != 0: listen & apply published txn snapshots
-                    // -------------------------------
+                    // --- Workers other than 0 apply each published snapshot ---
                     if index != 0 {
                         loop {
                             barrier.wait();
@@ -133,19 +109,19 @@ pub(super) fn gen_incremental_main(
                                     apply_ops(&mut inputs, snap.pending.as_slice());
 
                                     time_stamp += 1;
-                                    inputs.advance_to_all(time_stamp);
-                                    inputs.flush_all();
+                                    inputs.advance_dynamic_to(time_stamp);
+                                    inputs.flush_dynamic();
                                     #step_loop
 
                                     #metrics_write
 
-                                    #(#flush)*
+                                    #publish
 
                                     barrier.wait();
                                 }
 
                                 TxnAction::Quit => {
-                                    inputs.close_all();
+                                    inputs.close_dynamic();
                                     while probe.less_than(&time_stamp) {
                                         worker.step();
                                     }
@@ -164,9 +140,7 @@ pub(super) fn gen_incremental_main(
                         return;
                     }
 
-                    // -------------------------------
-                    // Worker 0: interactive driver
-                    // -------------------------------
+                    // --- Worker 0 drives the interactive shell ---
                     let rel_words = Inputs::names()
                         .iter()
                         .map(|name| (*name).to_owned())
@@ -194,22 +168,13 @@ pub(super) fn gen_incremental_main(
                                 println!("(txn aborted)");
                             }
 
-                            Cmd::Put { rel, tuple, diff } => {
+                            Cmd::Op(op) => {
                                 if !in_txn {
                                     in_txn = true;
                                     local_txn.clear_pending();
                                 }
-                                local_txn.enqueue(TxnOp::Put { rel, tuple, diff });
-                                println!("(queued put)");
-                            }
-
-                            Cmd::File { rel, path, diff } => {
-                                if !in_txn {
-                                    in_txn = true;
-                                    local_txn.clear_pending();
-                                }
-                                local_txn.enqueue(TxnOp::File { rel, path, diff });
-                                println!("(queued file)");
+                                local_txn.enqueue(op);
+                                println!("(queued)");
                             }
 
                             Cmd::Commit => {
@@ -228,26 +193,25 @@ pub(super) fn gen_incremental_main(
 
                                 barrier.wait();
 
-                                // Apply exactly what got published (keeps behavior consistent).
+                                // Apply the published snapshot, not `local_txn`, so worker
+                                // 0 applies exactly what every other worker does.
                                 let snap = shared_txn.read().unwrap().clone();
                                 apply_ops(&mut inputs, snap.pending.as_slice());
 
                                 time_stamp += 1;
-                                inputs.advance_to_all(time_stamp);
-                                inputs.flush_all();
+                                inputs.advance_dynamic_to(time_stamp);
+                                inputs.flush_dynamic();
                                 #step_loop
 
                                 #metrics_write
 
-                                #(#flush)*
+                                #publish
 
                                 barrier.wait();
 
-                                if index == 0 {
-                                    #emit_output
+                                #emit_output
 
-                                    println!("{:?}:\tCommitted & executed", round_timer.elapsed());
-                                }
+                                println!("{:?}:\tCommitted & executed", round_timer.elapsed());
 
                                 in_txn = false;
                                 local_txn.clear_pending();
@@ -270,7 +234,7 @@ pub(super) fn gen_incremental_main(
 
                                 barrier.wait();
 
-                                inputs.close_all();
+                                inputs.close_dynamic();
                                 while probe.less_than(&time_stamp) {
                                     worker.step();
                                 }

@@ -8,20 +8,31 @@ runnable.
 | Path                        | What it does                                                  | Time       |
 |-----------------------------|---------------------------------------------------------------|------------|
 | `cargo nextest run --workspace` | Per-crate `#[test]`s (nextest); doctests via `cargo test --doc` | <15 s warm |
-| `tests/fixtures/`           | ~120 hand-curated `.dl` programs, byte-diff vs `expected/`    | ~2 min     |
+| `tests/fixtures/`           | ~140 hand-curated `.dl` programs, byte-diff vs `expected/`    | ~2 min     |
 | `tests/oracle/`             | Real benchmarks, byte-diff vs **Soufflé** reference outputs   | ~30 min    |
 | `tests/lib/`                | Shared bash helpers (sourced by every runner)                 | —          |
 | `tests/ldbc/` *(future)*    | LDBC SNB correctness — empty placeholder                      | —          |
 
-Both `fixtures/` and `oracle/` ship **two runner scripts** —
-`run_compiler.sh` and `run_lib.sh`. The compiler runner builds the
-`flowlog-compiler` binary; the lib runner synthesises a small Rust
-crate that links `flowlog-build` + `flowlog-runtime` and calls
-`engine.run()` directly. They hit different code paths; both must
-pass.
+Every suite exercises **two lowering paths**. Compiler mode builds the
+`flowlog-compiler` binary and compiles each program to a standalone
+executable; library mode synthesises a small Rust crate that links
+`flowlog-build` + `flowlog-runtime` and calls `engine.run()` directly. They
+hit different code paths; both must pass. `fixtures/run.sh` runs both (or
+one, with `-m compiler|lib`); `oracle/` ships them as `run_compiler.sh` and
+`run_lib.sh`.
 
-SQLite I/O fixtures live alongside other `batch` and `inc` fixtures, with
-and without `ord`. Their `sqlite_setup.sql` creates the input database. Each `expected/<table>`
+Every fixture is one directory `tests/fixtures/<name>/`. A fixture is
+incremental when its program declares an `append` or `mutable` input; it
+then ships a `commands.txt` transaction transcript (`begin`, `insert <rel>
+<tuple>`, `delete <rel> @<file>`, `insert <rel>` for a nullary relation,
+`commit`, `quit`; the shell's `help` lists them all), and its name says so:
+`txn_*` (transaction shell mechanics), `mixed_*` (static and mutable inputs
+in one program), `append_*` (an append input), or `*_delta` (a batch feature
+re-checked per epoch). Static fixtures use none of these forms. The runners
+refuse a fixture whose name, `commands.txt`, and `.decl`s disagree.
+
+SQLite I/O fixtures (`sqlite_*`) follow the same layout, with and without
+`ord`. Their `sqlite_setup.sql` creates the input database. Each `expected/<table>`
 file contains the expected JSON rows of that output table, compared without
 row ordering. Empty files assert that the table exists and has no rows.
 The compiler runner sources `fixtures/sqlite_helper.sh` for these steps.
@@ -37,9 +48,9 @@ Unit and integration tests run under [cargo-nextest](https://nexte.st)
 # Unit + integration tests (nextest) + doctests
 make test
 
-# Fixtures (no flags, runs all ~95 programs)
-bash tests/fixtures/run_compiler.sh
-bash tests/fixtures/run_lib.sh
+# Fixtures: all ~140 programs through both modes; -j N for N workers
+bash tests/fixtures/run.sh -j 8
+bash tests/fixtures/run.sh -m lib recursive_tc_delta   # one fixture, one mode
 
 # Soufflé oracle, both lowering paths by default
 make oracle CONFIG=tests/oracle/config.txt
@@ -50,6 +61,17 @@ make oracle CONFIG=tests/oracle/config.txt \
             ARGS="--keep-datasets --workers $(nproc) \
                   --souffle-ref-cache /datasets/souffle_ref_tarballs"
 ```
+
+## Fixture runner caches
+
+`fixtures/run.sh` honors `CARGO_TARGET_DIR` and keeps everything under
+`<target>/e2e/`. `-j N` starts N workers that pull (mode, fixture) tasks from
+one queue; each worker owns a slot, `slot-<i>/`, with a Cargo target
+directory per mode (`compiler/cargo`, `lib/cargo`). The runtime and its
+dependencies build once per slot and mode, and every later task there
+compiles only its own crate. Slots persist between runs (about 300 MB per
+mode), so a warm run is much faster than the first; a run removes the slots
+beyond its `-j`. `rm -rf <target>/e2e` resets all of it.
 
 ## Oracle runner flags
 

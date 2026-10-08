@@ -15,11 +15,13 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
+//! | [`diff`] | Update weights and their arithmetic |
 //! | [`io`] | Reading relations into the engine, and the helpers around it |
 //! | [`error`] | [`RuntimeError`], everything the runtime can fail at |
 //! | [`intern`] | Thread-safe string interning pool (`lasso`) |
 //! | [`operators`] | Named dataflow operators used by generated rules |
 //! | [`arith`] | Arithmetic operators whose semantics FlowLog defines itself |
+//! | [`time`] | Engine and loop timestamps |
 //! | [`txn`] | Transaction state types shared with incremental drivers |
 //!
 //! The re-exported crates (`timely`, `differential_dataflow`, etc.) are
@@ -29,10 +31,12 @@
 #[cfg(feature = "cli")]
 mod args;
 pub mod arith;
+pub mod diff;
 pub mod error;
 pub mod intern;
 pub mod io;
 pub mod operators;
+pub mod time;
 pub mod txn;
 
 // Re-exports for generated code. The `include!()`'d code references these

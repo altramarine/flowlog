@@ -1,0 +1,15 @@
+begin
+insert employee 1,10
+insert employee 2,10
+insert employee 3,20
+insert employee 4,20
+insert dept 10,5000
+insert dept 20,8000
+commit
+begin
+insert employee 5,10
+delete employee 3,20
+delete dept 20,8000
+insert dept 20,9000
+commit
+quit

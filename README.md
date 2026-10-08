@@ -60,6 +60,13 @@ $ ./reach_bin -w 4
 
 Flag reference: [Compiler CLI](#compiler-cli). For incremental mode and the profiler, see <https://www.flowlog-rs.com/>.
 
+**Static, append and mutable inputs.** An input relation is `static` unless its `.decl` says otherwise: it is loaded once and never changes. Declaring an input `append` or `mutable` compiles an incremental program, which accepts updates after the first load: insertions only for an `append` relation, insertions and deletions for a `mutable` one. An append relation keeps the cheaper presence weights of batch evaluation, so a program that only ever grows should prefer it. The three can mix in one program; the work that reads only static inputs runs once:
+
+```datalog
+.decl Visited(x: int32) append
+.decl Arc(x: int32, y: int32) mutable
+```
+
 ## System requirements
 
 FlowLog's performance and stability depend on a number of host and OS-level
@@ -106,6 +113,7 @@ A `.dl` program compiles through five stages; three side modules assist the plan
 **Crates**
 
 - **`flowlog-build`** — library; compile `.dl` to Rust from `build.rs`.
+- **`flowlog-codegen`** — library; the code generator both frontends share.
 - **`flowlog-compiler`** — CLI; compile `.dl` to a standalone executable.
 - **`flowlog-runtime`** — linked into output (interning, IO, sort/merge, incremental-txn state); not a direct dep.
 
@@ -122,7 +130,6 @@ $ flowlog-compiler <PROGRAM> [OPTIONS]
 - `-D, --output-dir <DIR>` — default directory for `.output` files; `-` prints tuples to stdout. The executable can override it at runtime.
 - `-B, --build-dir <DIR>` — keep the generated Rust project in this directory for subsequent builds.
 - `-T, --target-dir <DIR>` — share Cargo artifacts across build directories; overrides `CARGO_TARGET_DIR`. Relative paths start at the compiler's working directory.
-- `--mode <MODE>` — `batch` (default) or `inc`.
 - `--str-intern` — intern string columns at load for faster joins and lower memory (off by default).
 - `-P, --profile` — collect execution statistics.
 - `-h, --help` — full help text.

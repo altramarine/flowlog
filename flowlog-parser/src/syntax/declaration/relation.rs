@@ -18,6 +18,56 @@ use crate::types::DataType;
 use crate::types::TypeId;
 use crate::types::TypeRegistry;
 
+// =============================================================================
+// Mutability
+// =============================================================================
+
+/// How a relation may change after its first epoch.
+///
+/// An EDB's `.decl` may declare one; an EDB that declares none is static.
+/// Variants are ordered from least to most changeable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Mutability {
+    /// Complete at the first epoch; the input closes afterwards.
+    #[default]
+    Static,
+    /// Accepts insertions at every epoch, never a deletion.
+    Append,
+    /// Accepts insertions and deletions at every epoch.
+    Mutable,
+}
+
+impl Mutability {
+    /// Lowers a `mutability` node.
+    pub(crate) fn from_node(node: Node) -> Result<Self, ParseError> {
+        debug_assert_eq!(node.rule(), Rule::mutability);
+        let keyword = node.children().next_any("mutability keyword")?;
+        match keyword.rule() {
+            Rule::static_kw => Ok(Self::Static),
+            Rule::append_kw => Ok(Self::Append),
+            Rule::mutable_kw => Ok(Self::Mutable),
+            other => Err(grammar_bug(format!(
+                "unexpected rule in mutability: {other:?}"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for Mutability {
+    /// The keyword a `.decl` spells this mutability with.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Static => "static",
+            Self::Append => "append",
+            Self::Mutable => "mutable",
+        })
+    }
+}
+
+// =============================================================================
+// Relation
+// =============================================================================
+
 /// A relation schema with input/output annotations.
 #[derive(Debug, Clone, Educe)]
 #[educe(PartialEq, Eq)]
@@ -46,6 +96,9 @@ pub struct Relation {
     /// Whether to print results size (e.g. row count)
     printsize: bool,
 
+    /// The mutability the `.decl` names, or `None` when it names none.
+    mutability: Option<Mutability>,
+
     /// Span of the `.decl` declaration.
     #[educe(PartialEq(ignore))]
     span: Span,
@@ -66,6 +119,7 @@ impl Relation {
         let name = name_node.text();
 
         let mut attributes: Vec<Attribute> = Vec::new();
+        let mut mutability = None;
 
         for child in children {
             match child.rule() {
@@ -104,6 +158,7 @@ impl Relation {
                         ));
                     }
                 }
+                Rule::mutability => mutability = Some(Mutability::from_node(child)?),
                 Rule::overridable_kw => {
                     return Err(ParseError::OverridableOutsideComp {
                         span: child.span(),
@@ -129,6 +184,7 @@ impl Relation {
             input: None,
             output: None,
             printsize: false,
+            mutability,
             span,
         })
     }
@@ -138,14 +194,19 @@ impl Relation {
     #[must_use]
     #[inline]
     pub fn new(name: &str, attributes: Vec<Attribute>) -> Self {
-        Self::from_components(name, attributes, Span::DUMMY)
+        Self::from_components(name, attributes, None, Span::DUMMY)
     }
 
     /// Build a relation from a pre-resolved name and attribute list.
     /// Callers must supply attributes whose `TypeId` is already bound
     /// to the program's `TypeRegistry`.
     #[must_use]
-    pub(crate) fn from_components(name: &str, attributes: Vec<Attribute>, span: Span) -> Self {
+    pub(crate) fn from_components(
+        name: &str,
+        attributes: Vec<Attribute>,
+        mutability: Option<Mutability>,
+        span: Span,
+    ) -> Self {
         let raw_name = name.to_string();
         let name = name.to_lowercase();
         let fingerprint = compute_fp(&name);
@@ -157,6 +218,7 @@ impl Relation {
             input: None,
             output: None,
             printsize: false,
+            mutability,
             span,
         }
     }
@@ -244,6 +306,29 @@ impl Relation {
     #[must_use]
     pub(crate) fn attribute_declared_ids(&self) -> Vec<TypeId> {
         self.attributes.iter().map(|a| a.declared_id()).collect()
+    }
+
+    /// The mutability the `.decl` names, or `None` when it names none,
+    /// which for an EDB means [`Mutability::Static`]. Only an EDB may name
+    /// one; a derived relation's mutability is inferred.
+    ///
+    /// For an EDB that rules also derive, the declaration covers only its
+    /// input. The relation as a whole is at least that mutable, and more
+    /// when its rules read something more mutable.
+    #[must_use]
+    #[inline]
+    pub fn mutability(&self) -> Option<Mutability> {
+        self.mutability
+    }
+
+    /// How this relation's input may change after the first epoch: the
+    /// mutability its `.decl` names, [`Mutability::Static`] when it names
+    /// none. Meaningful for an EDB; a derived relation's mutability is
+    /// inferred per stratum instead.
+    #[must_use]
+    #[inline]
+    pub fn input_mutability(&self) -> Mutability {
+        self.mutability.unwrap_or_default()
     }
 
     /// This relation's `.input` directive, or `None` when it has none.
@@ -358,6 +443,10 @@ impl fmt::Display for Relation {
         }
         write!(f, ")")?;
 
+        if let Some(mutability) = self.mutability {
+            write!(f, " {mutability}")?;
+        }
+
         // Every parameter is rendered resolved, so what a relation prints is
         // what it will read and write, not what the user happened to write.
         if let Some(source) = &self.input {
@@ -377,6 +466,10 @@ impl fmt::Display for Relation {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use flowlog_common::FileId;
@@ -387,7 +480,7 @@ mod tests {
     use super::*;
     use crate::FlowLogParser;
     use crate::assert_err;
-    use crate::test_util::parse_pair;
+    use crate::test_harness::parse_pair;
     use crate::types::DataType::Int32;
     use crate::types::DataType::String as Str;
     use crate::types::TypeRegistry;
@@ -487,7 +580,7 @@ mod tests {
     /// order: an `ORDER BY`, a nullary relation, and stderr each keep the
     /// sequential drain.
     #[rstest]
-    //     order_by       arity  to_stdout  parallel
+    // Cases: order_by, arity, to_stdout, parallel.
     #[case(None, 2, false, true)]
     #[case(Some("id"), 2, false, false)]
     #[case(None, 0, false, false)]
@@ -583,6 +676,33 @@ mod tests {
             parse_decl(&rel.to_string()).unwrap().attributes(),
             rel.attributes()
         );
+    }
+
+    /// The keyword after the attribute list sets the declared mutability, and a
+    /// rendered declaration spells it back.
+    #[rstest]
+    #[case("", None)]
+    #[case(" static", Some(Mutability::Static))]
+    #[case(" mutable", Some(Mutability::Mutable))]
+    fn decl_mutability_roundtrips_through_display(
+        #[case] keyword: &str,
+        #[case] expected: Option<Mutability>,
+    ) {
+        let rel = parse_decl(&format!(".decl R(x: number){keyword}")).unwrap();
+        assert_eq!(rel.mutability(), expected);
+        let reparsed = parse_decl(&rel.to_string()).unwrap();
+        assert_eq!(reparsed.mutability(), expected);
+    }
+
+    /// An input that names no mutability is static.
+    #[rstest]
+    #[case("", Mutability::Static)]
+    #[case(" static", Mutability::Static)]
+    #[case(" append", Mutability::Append)]
+    #[case(" mutable", Mutability::Mutable)]
+    fn input_mutability_defaults_to_static(#[case] keyword: &str, #[case] expected: Mutability) {
+        let rel = parse_decl(&format!(".decl R(x: number){keyword}")).unwrap();
+        assert_eq!(rel.input_mutability(), expected);
     }
 
     #[test]

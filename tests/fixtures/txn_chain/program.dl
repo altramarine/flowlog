@@ -1,0 +1,11 @@
+// ============================================================================
+// Suite   : txn_chain
+// Feature : 3 transactions in sequence with mixed ops, verify _t1/_t2/_t3
+// ============================================================================
+
+.decl Data(id: int32, val: int32) mutable
+.input Data(IO="command", delimiter=",")
+
+.decl Out(id: int32, val: int32)
+Out(id, v) :- Data(id, v).
+.output Out

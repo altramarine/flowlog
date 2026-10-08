@@ -1,0 +1,14 @@
+begin
+insert person 1
+insert person 2
+insert person 3
+insert person 4
+insert person 5
+insert blocked 2
+insert blocked 4
+commit
+begin
+delete blocked 2
+insert blocked 5
+commit
+quit

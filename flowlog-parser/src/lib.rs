@@ -19,8 +19,8 @@ mod program;
 mod syntax;
 mod types;
 
-#[cfg(test)]
-mod test_util;
+#[cfg(any(test, feature = "_test-harness"))]
+pub mod test_harness;
 
 // The node layers keep their crate-root spelling (`crate::ast::...`)
 // while living under `syntax/`; the alias saves every consumer from
@@ -49,6 +49,7 @@ pub use ast::TupleLit;
 pub use declaration::Attribute;
 pub use declaration::ExternFn;
 pub use declaration::InputSource;
+pub use declaration::Mutability;
 pub use declaration::OrderKey;
 pub use declaration::OutputSink;
 pub use declaration::Relation;
@@ -56,9 +57,6 @@ pub use error::DirectiveKind;
 pub use error::ParseError;
 pub use pipeline::fold::fold_constants;
 pub use pipeline::parse;
-// Not public API: the bottom rung of the `test_util` stage ladder.
-#[cfg(test)]
-pub(crate) use pipeline::parse_syntactic;
 pub use pipeline::prune::prune;
 pub use pipeline::typecheck::check_program;
 pub use program::InlineFact;

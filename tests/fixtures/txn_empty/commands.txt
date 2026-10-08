@@ -1,0 +1,11 @@
+begin
+insert a 1
+insert a 2
+insert b 2
+insert b 3
+commit
+begin
+insert a 5
+insert b 6
+commit
+quit

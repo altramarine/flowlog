@@ -30,16 +30,20 @@
 //! join already enforces `A`. It keeps the copies that buy a smaller join
 //! and skips the ones that only buy an arrangement.
 //!
-//! For each folded original filter, walk the plan top down and land a copy
-//! on every deepest node whose columns still cover the filter's variables,
-//! unless the first join above already carries the filter on its other
-//! input. A copy sits on the edge the walk came down, between a node and
-//! the one reader that led to it, and the node's column names come from
-//! that reader. Names cannot live on the node: two atoms of one relation
-//! can plan the same transformation, share its fingerprint, and name the
-//! same column differently. The walk is documented on
-//! [`RulePlanner::push_into`] and the shape of a copy on
-//! [`RulePlanner::insert_copy`].
+//! For each folded original filter, walk the plan top down to every
+//! deepest node whose columns still cover the filter's variables, unless
+//! the first join above already carries the filter on its other input,
+//! and land a copy at the top of the chain of maps above that node: on
+//! the edge into the join or antijoin that reads the chain. Lower in the
+//! chain the copy would shrink no join, since a chain has none, and would
+//! arrange rows and columns the maps above it drop; below a filter it
+//! would also leave the filter reading a join, which fuse cannot merge a
+//! filter into. A copy sits between the chain and the one reader that led
+//! to it, and the chain's column names come from that reader. Names
+//! cannot live on the node: two atoms of one relation can plan the same
+//! transformation, share its fingerprint, and name the same column
+//! differently. The walk is documented on [`RulePlanner::push_into`] and
+//! the shape of a copy on [`RulePlanner::insert_copy`].
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -186,10 +190,8 @@ impl RulePlanner {
         }
         let root = catalog.positive_atom_fingerprint(0)?;
         let originals = catalog.original_atom_fingerprints();
-        // Described before any copy is inserted: a copy can land on another
-        // filter's collection and redirect that filter's application to
-        // the copy, after which the application no longer reads the
-        // recorded fingerprint.
+        // Described before any copy is inserted, so every filter is read
+        // from the plan as core left it.
         let filters = self
             .folded_filters
             .iter()
@@ -208,7 +210,10 @@ impl RulePlanner {
                 continue;
             }
             let view = View::of_output(&self.transformation_infos[root_index]);
-            self.push_into(filter, root, None, view, false, originals)?;
+            // A copy wanted on the root's own edge is dropped: the root has
+            // no edge above it, and a copy there would repeat the fold that
+            // already applies the filter on the way to the root.
+            self.push_into(filter, root, &view, false, originals)?;
         }
         if self.transformation_infos.len() != count {
             self.sort_pipeline(originals)?;
@@ -280,13 +285,16 @@ impl RulePlanner {
         })
     }
 
-    /// Pushes `filter` into the subtree producing `fp`, reached through
-    /// the input edge of transformation `parent` that reads it as `view`,
-    /// adding a copy on each deepest node of the subtree that covers the
-    /// filter's variables. A copy sits on the edge it was reached through:
-    /// only `parent` reads it, and any other reader of the same collection
-    /// is untouched. The negated side of an antijoin never takes a copy,
-    /// where a filter would let rows through instead of removing them.
+    /// Pushes `filter` into the subtree producing `fp`, which its reader
+    /// sees as `view`, and lands a copy at the top of every chain of maps
+    /// whose deepest node covers the filter's variables: on the edge into
+    /// the join or antijoin reading the chain, so that only this reader
+    /// sees the copy and any other reader of the same collection is
+    /// untouched. Returns `true` if a copy belongs on the edge above `fp`
+    /// and is not placed yet, because `fp` is such a deepest node or a map
+    /// above it; the join reading the chain lands it, a map passes it up.
+    /// The negated side of an antijoin never takes a copy, where a filter
+    /// would let rows through instead of removing them.
     ///
     /// `enforced` says a copy landing directly on this subtree would be
     /// redundant: the first join above it, reached through unary maps and
@@ -299,13 +307,12 @@ impl RulePlanner {
         &mut self,
         filter: &Filter,
         fp: u64,
-        parent: Option<usize>,
-        view: View,
+        view: &View,
         enforced: bool,
         originals: &BTreeSet<u64>,
-    ) -> Result<(), PlanError> {
+    ) -> Result<bool, PlanError> {
         if fp == filter.fp || !view.covers(filter) {
-            return Ok(());
+            return Ok(false);
         }
         let index = self.producer(fp).ok_or_else(|| {
             PlanError::internal(format!("pushdown: collection {fp:#018x} has no producer"))
@@ -333,7 +340,10 @@ impl RulePlanner {
             let (child, child_view) = self.input(index, side)?;
             // An original atom is not a node: the walk stops at the
             // transformation that reads it.
-            if child == filter.fp || self.producer(child).is_none() || !child_view.covers(filter) {
+            let Some(target) = self.producer(child) else {
+                continue;
+            };
+            if child == filter.fp || !child_view.covers(filter) {
                 continue;
             }
             descended = true;
@@ -346,32 +356,41 @@ impl RulePlanner {
                     let (sibling, sibling_view) = self.input(index, side.other())?;
                     self.carries(sibling, filter) && sibling_view.covers(filter)
                 });
-            self.push_into(
-                filter,
-                child,
-                Some(index),
-                child_view,
-                child_enforced,
-                originals,
-            )?;
+            if !self.push_into(filter, child, &child_view, child_enforced, originals)? {
+                continue;
+            }
+            // Inside a chain of maps the copy climbs to the join that reads
+            // the chain; the module doc says why the top is the place.
+            if !binary {
+                return Ok(true);
+            }
+            self.land(filter, target, index, &child_view, originals)?;
         }
-        if descended || enforced {
-            return Ok(());
-        }
-        // The root has no edge above it; a copy there would repeat the fold
-        // that already applies the filter on the way to the root.
-        let Some(parent) = parent else {
-            return Ok(());
-        };
+        Ok(!descended && !enforced)
+    }
+
+    /// Lands a copy of `filter` on the edge from the output of
+    /// transformation `target` into transformation `reader`, which sees
+    /// that output as `view`, unless the output is a folded filter or has
+    /// more readers than producers.
+    fn land(
+        &mut self,
+        filter: &Filter,
+        target: usize,
+        reader: usize,
+        view: &View,
+        originals: &BTreeSet<u64>,
+    ) -> Result<(), PlanError> {
+        let fp = self.transformation_infos[target].output_info_fp();
         // Fuse arranges each producer by one key layout. The copy takes
-        // over `parent`'s read of the node, so the node's readers must not
+        // over `reader`'s read of the output, so its readers must not
         // outnumber its producers afterwards either. A folded filter is
         // read by all of its columns everywhere and takes no copy.
         let (producers, consumers) = &self.producer_consumer[&fp];
         if self.folded_filters.contains(&fp) || consumers.len() > producers.len() {
             return Ok(());
         }
-        self.insert_copy(filter, index, parent, &view, originals)
+        self.insert_copy(filter, target, reader, view, originals)
     }
 
     /// The input of transformation `index` on `side`: its fingerprint and
@@ -599,12 +618,12 @@ impl RulePlanner {
 // =============================================================================
 #[cfg(test)]
 mod tests {
-    use super::super::common::test_setup;
     use super::*;
+    use crate::test_harness::rule_planner;
 
     /// Plans `src` through prepare, core in body order, and pushdown.
     fn plan(src: &str) -> RulePlanner {
-        let (mut planner, mut catalog) = test_setup(src);
+        let (mut planner, mut catalog) = rule_planner(src);
         planner.prepare(&mut catalog).unwrap();
         while !catalog.is_planned() {
             planner.core(&mut catalog, (0, 1)).unwrap();
@@ -770,5 +789,115 @@ mod tests {
 
         assert_eq!(binary(&planner, "a", "c").len(), 1);
         assert!(binary(&planner, "a", "n").is_empty());
+    }
+
+    /// `C(x, "c", "d", z, v)` plans as two constant filters over `C`, read
+    /// by the join with `D`, and `E` folds into `B`.
+    const FILTERED_LEAF: &str = ".decl C(x: int32, t: symbol, k: symbol, z: int32, v: int32)\n.input C\n\
+         .decl D(z: int32, w: int32)\n.input D\n\
+         .decl B(x: int32, y: int32)\n.input B\n\
+         .decl E(x: int32)\n.input E\n\
+         .decl Out(x: int32, y: int32, z: int32, w: int32, v: int32)\n.output Out\n\
+         Out(x, y, z, w, v) :- C(x, \"c\", \"d\", z, v), D(z, w), B(x, y), E(x).\n";
+
+    /// The copy of `E` lands above both filters on `C`. Between them it
+    /// would leave the second filter reading a semijoin, and fuse has no
+    /// place for a filter's predicate on a semijoin or an antijoin.
+    #[test]
+    fn copy_never_separates_a_filter_from_its_producer() {
+        let planner = plan(FILTERED_LEAF);
+
+        let infos = planner.transformation_infos();
+        let applications = infos
+            .iter()
+            .filter(|tx| matches!(tx, TransformationInfo::JoinToKV { .. }))
+            .filter(|tx| tx.input_name().0 == "e")
+            .count();
+        assert_eq!(
+            applications, 2,
+            "the fold of `E` into `B` and one copy onto `C`"
+        );
+        for tx in infos {
+            let TransformationInfo::KVToKV {
+                input_info_fp,
+                predicates,
+                ..
+            } = tx
+            else {
+                continue;
+            };
+            if predicates.is_empty() {
+                continue;
+            }
+            let Some(producer) = planner.producer(*input_info_fp) else {
+                continue;
+            };
+            assert!(
+                matches!(infos[producer], TransformationInfo::KVToKV { .. }),
+                "filter {} reads a semijoin or antijoin",
+                tx.output_name()
+            );
+        }
+    }
+
+    /// The copy of `E` lands on the edge from `C`'s chain into the join
+    /// with `D`, the top of the chain, where it arranges only the rows
+    /// both filters let through.
+    #[test]
+    fn copy_lands_at_the_top_of_a_chain_of_maps() {
+        let planner = plan(FILTERED_LEAF);
+
+        let infos = planner.transformation_infos();
+        let join = infos
+            .iter()
+            .find(|tx| tx.input_name().1 == Some("d"))
+            .expect("the join of C and D");
+        let copy = &infos[planner
+            .producer(join.input_info_fp().0)
+            .expect("the join's left input is produced")];
+        assert_eq!(copy.input_name().0, "e", "the join reads the copy of E");
+        let (_, Some(mut fp)) = copy.input_info_fp() else {
+            panic!("a copy reads two inputs");
+        };
+        let mut filters = 0;
+        while let Some(index) = planner.producer(fp) {
+            let TransformationInfo::KVToKV {
+                input_info_fp,
+                predicates,
+                ..
+            } = &infos[index]
+            else {
+                panic!("the chain under the copy is maps only");
+            };
+            assert!(
+                !predicates.is_empty(),
+                "each map under the copy is a filter"
+            );
+            filters += 1;
+            fp = *input_info_fp;
+        }
+        assert_eq!(filters, 2, "both filters sit under the copy");
+    }
+
+    /// `P(x, "a", "b", _)` folds into `A` after two constant filters and a
+    /// projection. A folded filter takes no copy, so the copy of `!U` does
+    /// not land inside its chain either, where it would have separated
+    /// the second filter from its producer (issue #409).
+    #[test]
+    fn copy_skips_a_folded_filter_however_deep_its_chain() {
+        let planner = plan(
+            ".decl P(x: symbol, t: symbol, k: symbol, d: symbol)\n.input P\n\
+             .decl A(x: symbol)\n.input A\n\
+             .decl U(x: symbol, k: symbol, v: symbol)\n.input U\n\
+             .decl V(x: symbol)\n.output V\n\
+             V(x) :- P(x, \"a\", \"b\", _), A(x), !U(x, _, _).\n",
+        );
+
+        let antijoins = planner
+            .transformation_infos()
+            .iter()
+            .filter(|tx| matches!(tx, TransformationInfo::AntiJoinToKV { .. }))
+            .count();
+        assert_eq!(antijoins, 1, "only the fold of `!U`");
     }
 }

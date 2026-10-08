@@ -1,0 +1,4 @@
+begin
+delete edge 1,2
+commit
+quit

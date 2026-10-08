@@ -1,0 +1,32 @@
+[package]
+name = "flowlog-codegen"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Code generation for FlowLog: a planned program to differential-dataflow Rust."
+readme = "README.md"
+keywords = ["datalog", "dataflow", "compiler"]
+categories = ["compilers", "database"]
+
+[dependencies]
+flowlog-common.workspace = true
+flowlog-parser.workspace = true
+flowlog-planner.workspace = true
+flowlog-profiler.workspace = true
+
+codespan-reporting.workspace = true
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true, features = ["full"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+flowlog-parser = { workspace = true, features = ["_test-harness"] }
+rstest.workspace = true
+
+[lints]
+workspace = true

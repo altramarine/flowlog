@@ -11,7 +11,7 @@ mod stratum_planner;
 mod transformation;
 
 // External API: the planner entry point plus the plan types that
-// flowlog-build's codegen reads.
+// flowlog-codegen reads.
 pub use argument::TransformationArgument;
 pub use arithmetic::ArithmeticArgument;
 pub use arithmetic::FactorArgument;
@@ -28,3 +28,5 @@ pub(crate) use transformation::KeyValueLayout;
 pub use transformation::Transformation;
 pub use transformation::TransformationFlow;
 pub(crate) use transformation::TransformationInfo;
+
+pub use crate::stratifier::aggregate_mutability;

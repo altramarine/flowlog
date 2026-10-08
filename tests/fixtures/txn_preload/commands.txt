@@ -1,0 +1,10 @@
+begin
+insert edge 4,5
+commit
+begin
+insert edge @MoreEdges.csv
+commit
+begin
+delete edge 2,3
+commit
+quit

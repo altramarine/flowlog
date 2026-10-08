@@ -1,67 +1,54 @@
-//! Shared startup and source assembly. The `batch` and `inc` modules emit
-//! the main function for each execution mode.
+//! Assembles the generated `main.rs`.
 
 mod batch;
 mod inc;
 
-use flowlog_build::CodeParts;
-use flowlog_common::ExecutionMode;
+use flowlog_codegen::Skeleton;
 use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::Compiler;
 
 impl Compiler {
-    /// Renders `main.rs` with compiled directory defaults that runtime
-    /// arguments can override before workers start.
-    pub(crate) fn assemble(&self, parts: &CodeParts, imports: &TokenStream) -> String {
-        let (initialize_output, emit_output) = self.gen_output();
-        let input = self.gen_input(parts, &emit_output);
-        let fact_dir = self.options.fact_dir().unwrap_or(".");
-        let output_dir = if self.config.output_to_stdout() {
+    /// Returns the source of the executable's entry point. The executable
+    /// parses its runtime arguments, starts the timely workers, builds the
+    /// dataflow on each, loads the inputs from their files and inline facts,
+    /// and writes the outputs once the derivation settles. With a mutable
+    /// input it keeps the workers alive afterwards and runs the transaction
+    /// shell, writing each committed epoch's changes.
+    pub(crate) fn assemble(&self, skeleton: &Skeleton, imports: &TokenStream) -> String {
+        let output = self.gen_output();
+        let input = self.gen_input(skeleton, &output.emit);
+        let runtime_args = self.gen_runtime_args();
+        let main_fn = if self.program.is_incremental() {
+            inc::gen_incremental_main(skeleton, &input, &runtime_args, &output)
+        } else {
+            batch::gen_batch_main(skeleton, &input, &runtime_args, &output)
+        };
+        let declarations = &skeleton.declarations;
+
+        flowlog_common::pretty_print(quote! {
+            #imports
+            #declarations
+            #main_fn
+        })
+    }
+
+    /// Returns the parse of the runtime arguments, with the compiled
+    /// directories as defaults.
+    fn gen_runtime_args(&self) -> TokenStream {
+        let default_fact_dir = self.options.fact_dir().unwrap_or(".");
+        let default_output_dir = if self.config.output_to_stdout() {
             "-"
         } else {
             self.options.output_dir().unwrap_or(".")
         };
-        let create_output_dir = if self.program.idbs().iter().any(|idb| idb.has_output()) {
-            quote! {
-                if let Some(dir) = &output_dir {
-                    if let Err(error) = std::fs::create_dir_all(dir) {
-                        eprintln!(
-                            "failed to create output directory '{}': {}",
-                            dir.display(), error,
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            }
-        } else {
-            quote! {}
-        };
-        let startup = quote! {
-            let ::flowlog_runtime::RuntimeArgs {
-                config: timely_config, fact_dir, output_dir,
-            } = ::flowlog_runtime::RuntimeArgs::from_env(#fact_dir, #output_dir);
-            #create_output_dir
-            #initialize_output
-        };
-        let main_fn = match self.config.mode() {
-            ExecutionMode::Batch => batch::gen_batch_main(parts, &input, &startup, &emit_output),
-            ExecutionMode::Inc => inc::gen_incremental_main(parts, &input, &startup, &emit_output),
-        };
 
-        let type_declarations = &parts.type_declarations;
-        let profile_structs = &parts.profile_structs;
-        let profile_ops = &parts.profile_ops;
-
-        let file_ts = quote! {
-            #imports
-            #type_declarations
-            #profile_structs
-            #profile_ops
-            #main_fn
-        };
-
-        flowlog_common::pretty_print(file_ts)
+        let fact_dir = self.program.has_file_inputs().then(|| quote! { fact_dir, });
+        let output_dir = self.program.has_outputs().then(|| quote! { output_dir, });
+        quote! {
+            let ::flowlog_runtime::RuntimeArgs { config: timely_config, #fact_dir #output_dir .. } =
+                ::flowlog_runtime::RuntimeArgs::from_env(#default_fact_dir, #default_output_dir);
+        }
     }
 }

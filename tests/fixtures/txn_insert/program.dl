@@ -1,0 +1,11 @@
+// ============================================================================
+// Suite   : txn_insert
+// Feature : insert adds tuples, verify _t1 all +1
+// ============================================================================
+
+.decl Edge(src: int32, dst: int32) mutable
+.input Edge(IO="command", delimiter=",")
+
+.decl Out(src: int32, dst: int32)
+Out(s, d) :- Edge(s, d).
+.output Out

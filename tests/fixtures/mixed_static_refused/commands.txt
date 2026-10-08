@@ -1,0 +1,7 @@
+begin
+insert edge 5,50
+insert edge @More.csv
+insert seed 1
+insert seed 5
+commit
+quit

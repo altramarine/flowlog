@@ -1,0 +1,15 @@
+begin
+insert edge 1,2
+insert edge 2,3
+insert edge 3,4
+insert weight 1,2,10
+insert weight 2,3,20
+insert weight 3,4,30
+commit
+begin
+insert edge 4,5
+insert weight 4,5,40
+delete edge 2,3
+delete weight 2,3,20
+commit
+quit
