@@ -1,0 +1,8 @@
+.decl R(a: symbol, b: int32, witness: int32)
+.input R(IO="file", filename="R.csv", delimiter=",")
+.decl S(b: int32, c: int32, label: symbol)
+.input S(IO="file", filename="S.csv", delimiter=",")
+.decl Out(c: int32, a: symbol, label: symbol, again: symbol)
+
+Out(c,a,label,a) :- R(a,b,_), S(b,c,label), c >= 0, a != label.
+.output Out

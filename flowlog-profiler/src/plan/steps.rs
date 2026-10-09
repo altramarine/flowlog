@@ -79,6 +79,21 @@ pub(crate) fn dedup_recursive(mode: ExecutionMode) -> u32 {
     }
 }
 
+/// Operators from key-value dedup: arrangement plus a threshold or
+/// conversion (2). Signed recursive products add output conversion (3).
+pub(crate) fn dedup_by_key(mode: ExecutionMode, recursive: bool) -> u32 {
+    match mode {
+        ExecutionMode::Batch => 2,
+        ExecutionMode::Inc => {
+            if recursive {
+                3
+            } else {
+                2
+            }
+        }
+    }
+}
+
 /// Operators in `flowlog_antijoin` (excluding arrangement), by DD
 /// operator. The deref and projection steps are `.flat_map`s (hence
 /// FlatMap), as is the weight adjust on the `Present` path, while the

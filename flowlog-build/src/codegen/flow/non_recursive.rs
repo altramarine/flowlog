@@ -15,7 +15,6 @@ use flowlog_parser::AggregationOperator;
 use flowlog_planner::planner::StratumPlanner;
 use flowlog_profiler::PlanGraph;
 use flowlog_profiler::with_plan_graph;
-use proc_macro2::Ident;
 use proc_macro2::TokenStream;
 use quote::format_ident;
 use quote::quote;
@@ -71,41 +70,14 @@ impl CodeGen {
 
         for (idb_fp, head_fps) in stratum.idb_to_heads_map() {
             let output = self.find_global_ident(*idb_fp);
-            let outs: Vec<Ident> = head_fps
+            let mut sources: Vec<_> = head_fps
                 .iter()
-                .map(|fp| format_ident!("t_{}", fp))
+                .map(|fp| (*fp, format_ident!("t_{}", fp)))
                 .collect();
-
-            // Union the per-head collections.
-            let head = &outs[0];
-            let tail = &outs[1..];
-
-            // Fold into the existing binding rather than shadowing it.
-            let already_bound = bound_fps.contains(idb_fp);
-            let (concat_expr, concat_count) = if already_bound {
-                (quote! { #output.concatenate([ #( #outs.clone() ),* ]) }, 1)
-            } else if tail.is_empty() {
-                (quote! { #head.clone() }, 0)
-            } else {
-                (
-                    quote! { #head.clone().concatenate([ #( #tail.clone() ),* ]) },
-                    1,
-                )
-            };
-
-            with_plan_graph(plan_graph, |plan_graph| {
-                plan_graph.concat_dedup_operator(
-                    self.display_name(*idb_fp),
-                    outs.iter().map(|id| id.to_string()).collect(),
-                    output.to_string(),
-                    concat_count,
-                    false,
-                );
-            });
-
-            let mut block = quote! {
-                let #output = ::flowlog_runtime::operators::flowlog_dedup(#concat_expr);
-            };
+            if bound_fps.contains(idb_fp) {
+                sources.insert(0, (*idb_fp, output.clone()));
+            }
+            let mut block = self.gen_head_dedup(*idb_fp, &sources, &output, false, plan_graph)?;
 
             if let Some((agg_op, agg_pos, agg_arity)) = stratum.idb_to_aggregation_map().get(idb_fp)
             {

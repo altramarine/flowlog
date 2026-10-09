@@ -91,6 +91,7 @@ pub fn compile<P: AsRef<Path>>(program_path: P) -> io::Result<()> {
 #[derive(Default)]
 pub struct Builder {
     pub(crate) string_intern: bool,
+    pub(crate) group_join_outputs: bool,
     pub(crate) mode: ExecutionMode,
     pub(crate) profile: bool,
     pub(crate) include_dirs: Vec<PathBuf>,
@@ -103,6 +104,14 @@ impl Builder {
     /// interning is applied at `insert_<rel>` / drain.
     pub fn string_intern(mut self, enabled: bool) -> Self {
         self.string_intern = enabled;
+        self
+    }
+
+    /// Deduplicate rule heads as key-value pairs, preserving retained join-side
+    /// groups where available. Other rows split their columns in half. Disabled
+    /// by default: shorter exchange keys can concentrate work on fewer workers.
+    pub fn group_join_outputs(mut self, enabled: bool) -> Self {
+        self.group_join_outputs = enabled;
         self
     }
 

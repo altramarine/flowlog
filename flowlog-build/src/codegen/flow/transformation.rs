@@ -462,16 +462,6 @@ impl CodeGen {
                 let r = expect_arranged(arranged_map, right.fingerprint(), &r_base)?;
                 let out = find_local_ident(local_fp_to_ident, output.fingerprint());
 
-                // Profiling hook (optional)
-                with_plan_graph(plan_graph, |plan_graph| {
-                    plan_graph.map_join_operator(
-                        transformation_name,
-                        vec![l.to_string(), r.to_string()],
-                        out.to_string(),
-                        output.fingerprint(),
-                    );
-                });
-
                 // Type inference
                 self.record_transformation_output_type(
                     left.fingerprint(),
@@ -483,8 +473,6 @@ impl CodeGen {
                 // Output expression + predicates
                 let (jn_k, jn_lv, jn_rv) =
                     compute_join_param_tokens(flow.key(), flow.value(), flow.compares());
-                let out_val = self.build_key_val_from_join_args(flow.value(), si)?;
-
                 let left_type = self.find_global_data_type(left.fingerprint())?.clone();
                 let right_type = self.find_global_data_type(right.fingerprint())?.clone();
                 let cmp_pred = self.build_join_compare_predicate(
@@ -494,16 +482,51 @@ impl CodeGen {
                     &right_type,
                 )?;
                 let pred = combine_predicates(vec![cmp_pred]);
-                let join_body = join_body_tokens(pred, out_val);
+                let grouped = self.grouped_head_join_projection(output.fingerprint(), flow.value());
 
-                Ok(quote! {
-                    let #out = ::flowlog_runtime::operators::flowlog_join(
-                        #l.clone(),
-                        #r.clone(),
-                        #operator_name,
-                        |#jn_k, #jn_lv, #jn_rv| { #join_body },
-                    );
-                })
+                if let Some((key_arguments, value_arguments)) = grouped {
+                    let key = self.build_key_val_from_join_args(&key_arguments, si)?;
+                    let value = self.build_key_val_from_join_args(&value_arguments, si)?;
+                    let join_body = join_body_tokens(pred, quote! { (#key, #value) });
+                    with_plan_graph(plan_graph, |plan_graph| {
+                        plan_graph.map_join_operator(
+                            format!("{} (keyed output)", transformation_name),
+                            vec![l.to_string(), r.to_string()],
+                            out.to_string(),
+                            output.fingerprint(),
+                        );
+                    });
+
+                    // All rule sources share this layout at the head union;
+                    // restoring a row here would discard that grouping.
+                    Ok(quote! {
+                        let #out = ::flowlog_runtime::operators::flowlog_join(
+                            #l.clone(),
+                            #r.clone(),
+                            #operator_name,
+                            |#jn_k, #jn_lv, #jn_rv| { #join_body },
+                        );
+                    })
+                } else {
+                    let out_val = self.build_key_val_from_join_args(flow.value(), si)?;
+                    let join_body = join_body_tokens(pred, out_val);
+                    with_plan_graph(plan_graph, |plan_graph| {
+                        plan_graph.map_join_operator(
+                            transformation_name,
+                            vec![l.to_string(), r.to_string()],
+                            out.to_string(),
+                            output.fingerprint(),
+                        );
+                    });
+                    Ok(quote! {
+                        let #out = ::flowlog_runtime::operators::flowlog_join(
+                            #l.clone(),
+                            #r.clone(),
+                            #operator_name,
+                            |#jn_k, #jn_lv, #jn_rv| { #join_body },
+                        );
+                    })
+                }
             }
 
             // Join: Key-value ⋈ Key-value -> key-value

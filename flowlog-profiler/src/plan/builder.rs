@@ -292,6 +292,24 @@ impl PlanGraph {
         );
     }
 
+    /// Registers pair conversion, union, key-value dedup, and row restoration.
+    pub fn concat_keyed_dedup_operator(
+        &mut self,
+        name: String,
+        input_variable_names: Vec<String>,
+        output_variable_name: String,
+        source_steps: u32,
+        recursive: bool,
+    ) {
+        self.push_node(
+            format!("{}: concat & keyed dedup", name),
+            input_variable_names,
+            Some(output_variable_name),
+            source_steps + steps::dedup_by_key(self.mode, recursive) + 1,
+            None,
+        );
+    }
+
     pub fn recursive_enter_operator(
         &mut self,
         input_variable_name: String,
@@ -415,6 +433,26 @@ mod tests {
 
     use crate::Addr;
     use crate::PlanGraph;
+
+    #[test]
+    fn keyed_head_accounts_for_pair_conversion_and_row_restoration() {
+        let mut graph = PlanGraph::new(ExecutionMode::Batch);
+        graph.concat_keyed_dedup_operator("keyed".into(), vec![], "a".into(), 2, true);
+        graph.map_join_operator("after".into(), vec!["a".into()], "b".into(), 2);
+        let nodes = graph.nodes();
+        assert_eq!(
+            nodes[0].operators,
+            vec![
+                Addr(vec![0]),
+                Addr(vec![1]),
+                Addr(vec![2]),
+                Addr(vec![3]),
+                Addr(vec![4])
+            ]
+        );
+        assert_eq!(nodes[1].operators, vec![Addr(vec![5])]);
+        assert_eq!(nodes[1].parents, vec![0]);
+    }
 
     /// The recording methods drive scope tracking through the aggregate:
     /// a node recorded after leaving a subscope must not reuse the subscope
