@@ -5,11 +5,13 @@
 //! FlowLog's naming and semantic choices.
 
 mod dedup;
+mod dedup_by_key;
 mod join;
 mod map;
 mod reduce;
 
 pub use dedup::flowlog_dedup;
+pub use dedup_by_key::flowlog_dedup_by_key;
 pub use join::flowlog_antijoin;
 pub use join::flowlog_join;
 pub use map::flowlog_filter;

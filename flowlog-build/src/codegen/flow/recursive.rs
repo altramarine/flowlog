@@ -185,51 +185,16 @@ impl CodeGen {
             let next_ident = format_ident!("next_{}", idb_fp);
             next_bindings.insert(*idb_fp, next_ident.clone());
 
-            let mut sources: Vec<Ident> = head_fps
+            let mut sources: Vec<_> = head_fps
                 .iter()
-                .map(|fp| format_ident!("t_{}", fp))
+                .map(|fp| (*fp, format_ident!("t_{}", fp)))
                 .collect();
-
             if let Some(entered) = enter_bindings.get(idb_fp) {
-                sources.push(entered.clone());
+                sources.push((*idb_fp, entered.clone()));
             }
+            let mut block =
+                self.gen_head_dedup(*idb_fp, &sources, &next_ident, true, plan_graph)?;
 
-            // Build concatenation expression for all sources.
-            let (head, tail) = sources.split_first().ok_or_else(|| {
-                CodegenError::internal(format!(
-                    "recursive IDB 0x{idb_fp:016x} has no source \
-                     collections to union"
-                ))
-            })?;
-
-            let union_expr = if tail.is_empty() {
-                quote! { #head.clone() }
-            } else {
-                quote! { #head.clone().concatenate([ #( #tail.clone() ),* ]) }
-            };
-
-            // Dedup retains history at the loop's timestamp, so repeated
-            // derivations cannot keep feedback alive.
-            let mut block = quote! {
-                let #next_ident =
-                    ::flowlog_runtime::operators::flowlog_dedup(#union_expr);
-            };
-
-            with_plan_graph(plan_graph, |plan_graph| {
-                let source_names: Vec<String> = sources.iter().map(|id| id.to_string()).collect();
-                let concat_count = if tail.is_empty() { 0 } else { 1 };
-                plan_graph.concat_dedup_operator(
-                    self.display_name(*idb_fp),
-                    source_names,
-                    next_ident.to_string(),
-                    concat_count,
-                    true,
-                );
-            });
-
-            // ----------------------------------------------------------------
-            // Aggregation
-            // ----------------------------------------------------------------
             if let Some((agg_op, agg_pos, agg_arity)) = idb_to_aggregation_map.get(idb_fp) {
                 let output_name = self.display_name(*idb_fp);
                 let agg_type = self.agg_column_type(*idb_fp, *agg_pos)?;

@@ -1,0 +1,17 @@
+begin
+put r 1,10 +1
+put r 1,20 +1
+put s 10,7 +1
+put s 20,7 +1
+put s 10,8 +1
+commit
+begin
+put r 1,10 -1
+commit
+begin
+put r 1,20 -1
+commit
+begin
+put r 1,10 +1
+commit
+quit

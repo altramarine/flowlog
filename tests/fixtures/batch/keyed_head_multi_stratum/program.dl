@@ -1,0 +1,24 @@
+.decl R(a: int32, b: int32)
+R(1,10).
+R(1,20).
+.decl S(b: int32, c: int32, label: symbol)
+S(10,7,"same").
+S(20,7,"same").
+S(20,8,"other").
+.decl Next(c: int32, d: int32)
+Next(7,9).
+Next(8,9).
+Next(9,9).
+
+.decl Reach(c: int32, a: int32, label: symbol)
+Reach(c,a,label) :- R(a,b), S(b,c,label).
+Reach(d,a,label) :- Reach(c,a,label), Next(c,d).
+.output Reach
+
+.decl Base(c: int32, a: int32, label: symbol)
+Base(c,a,label) :- R(a,b), S(b,c,label).
+.output Base
+
+.decl Copy(a: int32, c: int32, label: symbol)
+Copy(a,c,label) :- Reach(c,a,label).
+.output Copy

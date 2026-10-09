@@ -23,6 +23,7 @@ pub use arg::const_to_token;
 pub use code_parts::CodeParts;
 pub use error::CodegenError;
 pub use features::Features;
+use flow::head_layout::HeadOutputLayouts;
 use flowlog_common::Config;
 use flowlog_parser::DataType;
 use flowlog_parser::Program;
@@ -55,6 +56,7 @@ pub struct CodeGen {
     /// across strata so a later stratum can reuse an arrangement built by an
     /// earlier stratum's prelude. Reset at the start of every `generate`.
     pub(crate) outer_arranged: HashMap<u64, Ident>,
+    pub(in crate::codegen) head_output_layouts: HeadOutputLayouts,
 }
 
 impl CodeGen {
@@ -66,6 +68,7 @@ impl CodeGen {
             global_fp_to_type: HashMap::new(),
             features: Features::default(),
             outer_arranged: HashMap::new(),
+            head_output_layouts: HeadOutputLayouts::default(),
         };
         cg.make_global_data_type_map();
         cg
@@ -84,6 +87,11 @@ impl CodeGen {
         self.make_global_ident_map();
         self.features.reset();
         self.outer_arranged.clear();
+        self.head_output_layouts = if self.config.group_join_outputs {
+            HeadOutputLayouts::from_plan(program_planner)
+        } else {
+            HeadOutputLayouts::default()
+        };
         self.collect_parts(program_planner.strata(), plan_graph)
     }
 }

@@ -89,11 +89,13 @@ run_test() {
 
     # Per-fixture `compile_flags`: translate to Builder knob env vars.
     LIB_RUNNER_STR_INTERN=0
+    LIB_RUNNER_GROUP_JOIN_OUTPUTS=0
     if [[ -f "$test_dir/compile_flags" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             for tok in $line; do
                 case "$tok" in
                     --str-intern) LIB_RUNNER_STR_INTERN=1 ;;
+                    --group-join-outputs) LIB_RUNNER_GROUP_JOIN_OUTPUTS=1 ;;
                 esac
             done
         done < "$test_dir/compile_flags"

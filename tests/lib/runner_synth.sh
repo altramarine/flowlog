@@ -327,6 +327,7 @@ write_build_rs() {
 
     local knob_setters=""
     (( ${LIB_RUNNER_STR_INTERN:-0} )) && knob_setters+=$'        .string_intern(true)\n'
+    (( ${LIB_RUNNER_GROUP_JOIN_OUTPUTS:-0} )) && knob_setters+=$'        .group_join_outputs(true)\n'
 
     # Defaults to `Batch`; `LIB_RUNNER_INC` toggles to incremental.
     local mode_setter=""

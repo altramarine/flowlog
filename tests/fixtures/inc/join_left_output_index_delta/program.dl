@@ -1,0 +1,13 @@
+.decl R(a: int32, b: int32)
+.input R(IO="command", delimiter=",")
+.decl S(b: int32, c: int32)
+.input S(IO="command", delimiter=",")
+.decl Out(c: int32, a: int32)
+
+Out(c,a) :- R(a,b), S(b,c).
+.output Out
+
+.decl Reach(a: int32, c: int32)
+Reach(a,b) :- R(a,b).
+Reach(a,c) :- Reach(a,b), S(b,c).
+.output Reach
