@@ -120,8 +120,8 @@ mod tests {
             }
         }
 
-        // The two ear projections supplement the eight shared collections.
-        assert_eq!(owner.len(), 10, "expected 10 prelude transformations");
+        // Four ear projections supplement the eight shared collections.
+        assert_eq!(owner.len(), 12, "expected 12 prelude transformations");
     }
 
     /// `Q`'s join of `R` and `S` holds the rows `P` computed one stratum

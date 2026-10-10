@@ -34,7 +34,7 @@ impl RulePlanner {
         catalog: &mut Catalog,
         join_tuple_index: (usize, usize),
     ) -> Result<(), PlanError> {
-        if let Some((ear_index, separator)) = Self::next_gyo_ear(catalog)? {
+        if let Some((ear_index, separator)) = Self::next_gyo_ear(catalog, 3)? {
             return self.plan_gyo_ear(catalog, ear_index, &separator);
         }
         self.join_and_reduce(catalog, join_tuple_index)
@@ -49,7 +49,9 @@ impl RulePlanner {
     ) -> Result<(), PlanError> {
         Self::reduce_gyo_ear(catalog, ear_index, separator)?;
         self.prepare(catalog)?;
-        while let Some((ear_index, separator)) = Self::next_gyo_ear(catalog)? {
+        // The remaining original ear must still filter the core when only
+        // two atoms remain, before either deferred relation is expanded.
+        while let Some((ear_index, separator)) = Self::next_gyo_ear(catalog, 2)? {
             Self::reduce_gyo_ear(catalog, ear_index, &separator)?;
             self.prepare(catalog)?;
         }
@@ -335,7 +337,10 @@ impl RulePlanner {
     }
 
     /// Returns the last original atom whose shared variables fit in another atom.
-    fn next_gyo_ear(catalog: &Catalog) -> Result<Option<(usize, BTreeSet<String>)>, PlanError> {
+    fn next_gyo_ear(
+        catalog: &Catalog,
+        minimum_atoms: usize,
+    ) -> Result<Option<(usize, BTreeSet<String>)>, PlanError> {
         if !catalog.filters().is_empty() {
             return Ok(None);
         }
@@ -349,7 +354,9 @@ impl RulePlanner {
                 Predicate::NegativeAtom(_) | Predicate::Compare(_) => None,
             })
             .collect::<Vec<_>>();
-        if positive_atoms.len() != catalog.rule().rhs().len() || positive_atoms.len() < 3 {
+        if positive_atoms.len() != catalog.rule().rhs().len()
+            || positive_atoms.len() < minimum_atoms
+        {
             return Ok(None);
         }
 
@@ -438,6 +445,38 @@ impl RulePlanner {
 mod tests {
     use super::super::common::test_setup;
     use super::*;
+
+    #[test]
+    fn gyo_reduces_both_pointsto_ears_before_expansion() {
+        let (mut planner, mut catalog) = test_setup(
+            ".decl Store(from: int32, base: int32, fld: int32)\n.input Store\n\
+             .decl PointsTo(heap: int32, var: int32)\n.input PointsTo\n\
+             .decl Out(heap: int32, fld: int32, baseheap: int32)\n.output Out\n\
+             Out(heap, fld, baseheap) :- Store(from, base, fld), \
+             PointsTo(heap, from), PointsTo(baseheap, base).\n",
+        );
+        planner.prepare(&mut catalog).expect("prepare");
+        planner.core(&mut catalog, (0, 1)).expect("core");
+
+        let joins = planner
+            .transformation_infos()
+            .iter()
+            .filter(|step| matches!(step, TransformationInfo::JoinToKV { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(joins.len(), 4);
+        for join in &joins[..2] {
+            let (left, right) = join.input_kv_layout();
+            assert_eq!(left.key().len(), 1);
+            assert!(left.value().is_empty());
+            assert!(!right.expect("semijoin target").value().is_empty());
+        }
+        for join in &joins[2..] {
+            let (left, right) = join.input_kv_layout();
+            assert!(!left.value().is_empty());
+            assert!(!right.expect("expansion relation").value().is_empty());
+        }
+        assert!(catalog.is_planned());
+    }
 
     #[rstest::rstest]
     #[case("Out(x, y) :- A(a, x), B(a, b), C(b, y).")]
@@ -591,6 +630,7 @@ mod tests {
             right_inputs,
             vec![
                 Some("r".to_string()),
+                Some("(π[x,y](t) ⋉[x,y] r)".to_string()),
                 Some("s".to_string()),
                 Some("t".to_string()),
             ]

@@ -1,0 +1,22 @@
+begin
+put seed 100,1 +1
+put seed 10,2 +1
+put store 1,2,7 +1
+put load 2,7,3 +1
+commit
+begin
+put seed 101,1 +1
+commit
+begin
+put seed 11,2 +1
+commit
+begin
+put seed 10,2 -1
+commit
+begin
+put seed 11,2 -1
+commit
+begin
+put seed 12,2 +1
+commit
+quit

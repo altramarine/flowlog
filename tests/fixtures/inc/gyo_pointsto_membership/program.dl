@@ -1,0 +1,15 @@
+.decl Seed(heap: int32, var: int32)
+.input Seed(IO="command", delimiter=",")
+.decl Store(from: int32, base: int32, fld: int32)
+.input Store(IO="command", delimiter=",")
+.decl Load(base: int32, fld: int32, to: int32)
+.input Load(IO="command", delimiter=",")
+
+.decl PointsTo(heap: int32, var: int32)
+PointsTo(heap, var) :- Seed(heap, var).
+PointsTo(heap, to) :- Load(base, fld, to), PointsTo(baseheap, base), Field(heap, fld, baseheap).
+.output PointsTo
+
+.decl Field(heap: int32, fld: int32, baseheap: int32)
+Field(heap, fld, baseheap) :- Store(from, base, fld), PointsTo(heap, from), PointsTo(baseheap, base).
+.output Field
