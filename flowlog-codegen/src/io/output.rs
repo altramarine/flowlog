@@ -115,18 +115,19 @@ impl Codegen {
         name: &str,
         mutability: Mutability,
     ) -> TokenStream {
-        // After the dedup each row weighs one, so the rows' summed weights are
-        // the count's change. A presence weight is lifted to a signed count
-        // first, since presence cannot be summed into a count.
+        // Presence inputs and rule heads already announce each row once.
+        // Counting needs signed weights, but no second membership trace.
+        // Mutable inputs can retain signed debt, so keep their threshold.
         let op_name = format!("{name}: inspect size");
-        let deduped = quote! { ::flowlog_runtime::operators::flowlog_dedup(#collection.clone()) };
         let counted = match mutability {
             Mutability::Static | Mutability::Append => quote! {
                 ::flowlog_runtime::operators::flowlog_lift::<::flowlog_runtime::diff::Mutable, _, _, _>(
-                    #deduped, #op_name,
+                    #collection.clone(), #op_name,
                 )
             },
-            Mutability::Mutable => deduped,
+            Mutability::Mutable => quote! {
+                ::flowlog_runtime::operators::flowlog_dedup(#collection.clone())
+            },
         };
         let probe = self.gen_probe();
 
@@ -280,14 +281,28 @@ mod tests {
         quote! {{
             let emitter_r = emitter_r.clone();
             ::flowlog_runtime::operators::flowlog_lift::<::flowlog_runtime::diff::Mutable, _, _, _>(
-                ::flowlog_runtime::operators::flowlog_dedup(r.clone()),
-                "R: inspect size",
+                r.clone(), "R: inspect size",
             )
             .map(|_| ())
             .consolidate()
             .inspect(move |(_data, time, size)| {
                 emitter_r.record_size(time, *size);
             });
+        }}
+    )]
+    #[case::append(
+        " append",
+        quote! {{
+            let emitter_r = emitter_r.clone();
+            ::flowlog_runtime::operators::flowlog_lift::<::flowlog_runtime::diff::Mutable, _, _, _>(
+                r.clone(), "R: inspect size",
+            )
+            .map(|_| ())
+            .consolidate()
+            .inspect(move |(_data, time, size)| {
+                emitter_r.record_size(time, *size);
+            })
+            .probe_with(&probe);
         }}
     )]
     #[case::mutable(
