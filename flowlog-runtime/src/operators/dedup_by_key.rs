@@ -9,13 +9,19 @@ use differential_dataflow::VecCollection;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::hashable::Hashable;
 use differential_dataflow::lattice::Lattice;
+use differential_dataflow::operators::arrange::Arranged;
+use differential_dataflow::operators::arrange::TraceAgent;
+use differential_dataflow::operators::arrange::arrangement::arrange_core;
 use differential_dataflow::trace::BatchReader;
 use differential_dataflow::trace::Cursor;
 use differential_dataflow::trace::Navigable;
 use differential_dataflow::trace::TraceReader;
+use differential_dataflow::trace::implementations::ValBatcher;
 use differential_dataflow::trace::implementations::ValBuilder;
 use differential_dataflow::trace::implementations::ValSpine;
+use differential_dataflow::trace::implementations::chunker::ContainerChunker;
 use timely::PartialOrder;
+use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::Operator;
 use timely::order::Product;
@@ -28,7 +34,8 @@ use crate::diff::Presence;
 use crate::time::LexLoop;
 
 /// Normalizes membership of complete `(key, value)` pairs. Exchange hashes
-/// only the key; different values under that key remain separate members.
+/// the complete pair; local traces group values by key. Distinct values
+/// under a key remain separate members.
 /// Counts, deletions, and recursive timestamps follow `flowlog_dedup`.
 pub fn flowlog_dedup_by_key<C: FlowlogDedupByKey>(collection: C) -> C {
     collection.dedup_by_key()
@@ -42,20 +49,21 @@ pub trait FlowlogDedupByKey: Sized {
 
 impl<'scope, K, V, R> FlowlogDedupByKey for VecCollection<'scope, (), (K, V), R>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
     R: Presence,
 {
     fn dedup_by_key(self) -> Self {
-        self.arrange_by_key_named("Arrange: DedupByKey")
-            .as_collection(|key, value| (key.clone(), value.clone()))
+        arrange_pairs(self).as_collection(|key, value| (key.clone(), value.clone()))
     }
 }
 
 impl<'scope, E: Counter, K, V, R> FlowlogDedupByKey for VecCollection<'scope, E, (K, V), R>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
     R: Presence,
 {
     fn dedup_by_key(self) -> Self {
@@ -66,8 +74,9 @@ where
 impl<'scope, I: Counter, K, V, R> FlowlogDedupByKey
     for VecCollection<'scope, Product<(), I>, (K, V), R>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
     R: Presence,
 {
     fn dedup_by_key(self) -> Self {
@@ -78,8 +87,9 @@ where
 impl<'scope, E: Counter, I: Counter, K, V, R> FlowlogDedupByKey
     for VecCollection<'scope, Product<E, I>, (K, V), R>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
     R: Presence,
 {
     fn dedup_by_key(self) -> Self {
@@ -89,8 +99,9 @@ where
 
 impl<'scope, K, V> FlowlogDedupByKey for VecCollection<'scope, (), (K, V), i32>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
 {
     fn dedup_by_key(self) -> Self {
         threshold_by_key_total(self, membership_delta)
@@ -99,8 +110,9 @@ where
 
 impl<'scope, E: Counter, K, V> FlowlogDedupByKey for VecCollection<'scope, E, (K, V), i32>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
 {
     fn dedup_by_key(self) -> Self {
         threshold_by_key_total(self, membership_delta)
@@ -110,8 +122,9 @@ where
 impl<'scope, I: Counter, K, V> FlowlogDedupByKey
     for VecCollection<'scope, Product<(), I>, (K, V), i32>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
 {
     fn dedup_by_key(self) -> Self {
         threshold_by_key_total(self, membership_delta)
@@ -121,11 +134,12 @@ where
 impl<'scope, E: Counter, I: Counter, K, V> FlowlogDedupByKey
     for VecCollection<'scope, Product<E, I>, (K, V), i32>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
 {
     fn dedup_by_key(self) -> Self {
-        self.arrange_by_key_named("Arrange: DedupByKey")
+        arrange_pairs(self)
             .reduce_abelian::<_, ValBuilder<K, V, Product<E, I>, i32>, ValSpine<K, V, Product<E, I>, i32>, _, _>(
                 "DedupByKey",
                 |_, input, output| {
@@ -147,8 +161,9 @@ where
 
 impl<'scope, K, V, R> FlowlogDedupByKey for VecCollection<'scope, LexLoop, (K, V), R>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
     R: Presence,
 {
     fn dedup_by_key(self) -> Self {
@@ -158,12 +173,38 @@ where
 
 impl<'scope, K, V> FlowlogDedupByKey for VecCollection<'scope, LexLoop, (K, V), diff::Mutable>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
 {
     fn dedup_by_key(self) -> Self {
         threshold_by_key_total(self, membership_delta)
     }
+}
+
+/// Shards complete pairs while retaining key-value order within each trace.
+/// A key may span workers: this trace supports pair membership, not key joins.
+fn arrange_pairs<'scope, T, K, V, R>(
+    collection: VecCollection<'scope, T, (K, V), R>,
+) -> Arranged<'scope, TraceAgent<ValSpine<K, V, T, R>>>
+where
+    T: Timestamp + Lattice,
+    K: ExchangeData,
+    V: ExchangeData,
+    (K, V): Hashable,
+    R: ExchangeData + Semigroup,
+{
+    // Dedup tests each value independently. Hashing the pair avoids concentrating
+    // a low-cardinality key on one worker, at the cost of shorter local groups.
+    let exchange = Exchange::new(|update: &((K, V), T, R)| update.0.hashed().into());
+    arrange_core::<
+        _,
+        _,
+        ContainerChunker<Vec<((K, V), T, R)>>,
+        ValBatcher<K, V, T, R>,
+        ValBuilder<K, V, T, R>,
+        ValSpine<K, V, T, R>,
+    >(collection.inner, exchange, "Arrange: DedupByKey")
 }
 
 fn membership_delta(new: &i32, prior: Option<&i32>) -> Option<i32> {
@@ -179,12 +220,13 @@ fn threshold_by_key_total<'scope, T, K, V, R, F>(
 ) -> VecCollection<'scope, T, (K, V), R>
 where
     T: Timestamp + Lattice + TotalOrder,
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
     R: ExchangeData + Semigroup,
     F: FnMut(&R, Option<&R>) -> Option<R> + 'static,
 {
-    let arranged = collection.arrange_by_key_named("Arrange: DedupByKey");
+    let arranged = arrange_pairs(collection);
     let mut trace = arranged.trace;
     arranged
         .stream
@@ -259,11 +301,12 @@ fn first_pairs<'scope, E: Counter, I: Counter, K, V, R>(
     collection: VecCollection<'scope, Product<E, I>, (K, V), R>,
 ) -> VecCollection<'scope, Product<E, I>, (K, V), R>
 where
-    K: ExchangeData + Hashable,
+    K: ExchangeData,
     V: ExchangeData,
+    (K, V): Hashable,
     R: Presence,
 {
-    let arranged = collection.arrange_by_key_named("Arrange: DedupByKey");
+    let arranged = arrange_pairs(collection);
     let mut trace = arranged.trace;
     arranged
         .stream
@@ -340,6 +383,53 @@ mod tests {
 
     type Pair = (u64, char);
     type PairUpdate<R> = (Pair, u32, R);
+
+    #[rstest::rstest]
+    #[case(diff::Static)]
+    #[case(diff::Append)]
+    #[case(1i32)]
+    fn one_key_is_sharded_by_value_and_duplicates_still_meet<R>(#[case] weight: R)
+    where
+        R: ExchangeData + Semigroup + Sync,
+        for<'scope> VecCollection<'scope, u32, Pair, R>: FlowlogDedupByKey,
+    {
+        let guards = timely::execute(timely::Config::process(4), move |worker| {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut input = worker.dataflow::<u32, _, _>(|scope| {
+                let (input, rows) = scope.new_collection::<Pair, R>();
+                let seen = Rc::clone(&seen);
+                flowlog_dedup_by_key(rows).inspect(move |update| seen.borrow_mut().push(update.0));
+                input
+            });
+            for value in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] {
+                input.update((1, value), weight.clone());
+            }
+            input.close();
+            while worker.step() {}
+            seen.take()
+        })
+        .unwrap();
+        let shards: Vec<_> = guards.join().into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            shards.iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 2, 2, 2]
+        );
+        let mut actual: Vec<_> = shards.into_iter().flatten().collect();
+        actual.sort();
+        assert_eq!(
+            actual,
+            [
+                (1, 'a'),
+                (1, 'b'),
+                (1, 'c'),
+                (1, 'd'),
+                (1, 'e'),
+                (1, 'f'),
+                (1, 'g'),
+                (1, 'h')
+            ]
+        );
+    }
 
     fn run_epochs<R>(epochs: Vec<Vec<(Pair, R)>>) -> Vec<PairUpdate<R>>
     where

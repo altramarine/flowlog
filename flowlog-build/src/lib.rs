@@ -101,8 +101,8 @@ impl Builder {
         self
     }
 
-    /// Deduplicate rule heads as key-value pairs. Disabled by default:
-    /// shorter exchange keys can concentrate work on fewer workers.
+    /// Deduplicate rule heads as key-value pairs, sharded by the complete pair.
+    /// Disabled by default.
     pub fn group_join_outputs(mut self, enabled: bool) -> Self {
         self.group_join_outputs = enabled;
         self
