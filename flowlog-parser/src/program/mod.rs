@@ -20,6 +20,8 @@ pub use fact::InlineFact;
 
 use crate::ast::FlowLogRule;
 use crate::declaration::ExternFn;
+use crate::declaration::InputSource;
+use crate::declaration::Mutability;
 use crate::declaration::Relation;
 use crate::types::TypeRegistry;
 
@@ -85,6 +87,41 @@ impl Program {
             .iter()
             .filter(|rel| self.is_edb_relation(rel))
             .collect()
+    }
+
+    /// Returns each input relation loaded from a file at startup, with the
+    /// file's name, in declaration order.
+    pub fn file_inputs(&self) -> impl Iterator<Item = (&Relation, &str)> {
+        self.edbs().into_iter().filter_map(|relation| {
+            relation
+                .input()
+                .filter(|source| source.is_file_backed())
+                .and_then(InputSource::filename)
+                .map(|filename| (relation, filename))
+        })
+    }
+
+    /// Returns `true` if some input relation is loaded from a file at
+    /// startup.
+    #[must_use]
+    pub fn has_file_inputs(&self) -> bool {
+        self.file_inputs().next().is_some()
+    }
+
+    /// Returns `true` if some relation has an `.output` directive.
+    #[must_use]
+    pub fn has_outputs(&self) -> bool {
+        self.relations.iter().any(Relation::has_output)
+    }
+
+    /// Returns `true` if some EDB declares itself `append` or `mutable`,
+    /// so the engine runs across epochs as inputs change; `false` if every
+    /// input is static, so it runs once.
+    #[must_use]
+    pub fn is_incremental(&self) -> bool {
+        self.edbs()
+            .into_iter()
+            .any(|rel| rel.input_mutability() != Mutability::Static)
     }
 
     /// Ordered EDB relation names (sorted lexicographically).
@@ -164,7 +201,9 @@ impl Program {
 
     // --- Inline facts ---
 
-    /// Inline facts (ground tuples).
+    /// Inline facts (ground tuples), keyed by canonical relation name. A
+    /// relation is a set, so each fact is listed once, by value: `R(1)`
+    /// written twice, or as `R(1)` and `R(01)`, is one fact.
     #[must_use]
     #[inline]
     pub fn facts(&self) -> &HashMap<String, Vec<InlineFact>> {
@@ -204,16 +243,19 @@ impl Program {
     }
 
     #[inline]
-    fn is_edb_relation(&self, rel: &Relation) -> bool {
+    pub(crate) fn is_edb_relation(&self, rel: &Relation) -> bool {
         rel.has_input() || self.has_inline_facts(rel.name())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use crate::InputSource;
+    use crate::Mutability;
     use crate::Relation;
-    use crate::test_util::assembled;
+    use crate::test_harness::assembled;
 
     #[test]
     fn rules_are_returned_in_source_order() {
@@ -298,5 +340,63 @@ mod tests {
         );
         assert_eq!(names(file_backed), vec!["both", "file_only"]);
         assert_eq!(names(inline_facts), vec!["both", "fact_only"]);
+    }
+
+    /// A mutability on a `.decl` inside a `.comp` reaches the inlined relation.
+    #[test]
+    fn component_decl_carries_its_mutability() {
+        let program = assembled(
+            "
+            .comp C {
+                .decl E(x: number) mutable
+                .input E
+                .decl R(x: number)
+                .output R
+                R(x) :- E(x).
+            }
+            .init c = C
+            ",
+        )
+        .expect("assembles");
+        let edb = program
+            .relations()
+            .iter()
+            .find(|rel| rel.raw_name() == "c.E")
+            .expect("inlined");
+        assert_eq!(edb.mutability(), Some(Mutability::Mutable));
+    }
+
+    /// The engine runs across epochs exactly when some input, fed by
+    /// `.input` or by inline facts, declares itself append or mutable.
+    #[rstest]
+    #[case::no_input(".decl R(x: number) .output R R(1).", false)]
+    #[case::static_input(".decl E(x: number) .input E .output E", false)]
+    #[case::append_input(".decl E(x: number) append .input E .output E", true)]
+    #[case::mutable_input(".decl E(x: number) mutable .input E .output E", true)]
+    #[case::mutable_inline_facts(".decl E(x: number) mutable E(1). .output E", true)]
+    fn is_incremental_follows_the_inputs(#[case] src: &str, #[case] expected: bool) {
+        assert_eq!(
+            assembled(src).expect("assembles").is_incremental(),
+            expected
+        );
+    }
+
+    /// Only an `.input` with a file behind it is a file input: inline
+    /// facts and command-fed inputs are not.
+    #[test]
+    fn file_inputs_are_the_inputs_with_a_file() {
+        let program = assembled(
+            ".decl A(x: number) .input A(IO=\"file\", filename=\"a.csv\")
+             .decl B(x: number) .input B(IO=\"command\")
+             .decl C(x: number) C(1).
+             .decl Out(x: number) .output Out
+             Out(x) :- A(x). Out(x) :- B(x). Out(x) :- C(x).",
+        )
+        .expect("assembles");
+        let names: Vec<(&str, &str)> = program
+            .file_inputs()
+            .map(|(relation, filename)| (relation.raw_name(), filename))
+            .collect();
+        assert_eq!(names, [("A", "a.csv")]);
     }
 }

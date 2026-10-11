@@ -1,0 +1,10 @@
+begin
+insert data 1,100
+insert data 2,200
+insert data 3,300
+abort
+begin
+insert data 4,400
+insert data 5,500
+commit
+quit

@@ -68,6 +68,11 @@ impl Assembler {
             self.output_directives,
             self.printsize_directives,
         )?;
+        // Component directives were applied while inlining, so only now is
+        // the full set of reported relations known.
+        if !self.relations.iter().any(Relation::is_output_printsize) {
+            return Err(ParseError::NoOutput);
+        }
         inline::normalize_dots(&mut self.relations, &mut self.rules, &mut self.raw_facts);
         substitute::substitute_assignments(&mut self.rules)?;
         validate::validate_relation_references(&self.relations, &self.rules, &self.raw_facts)?;
@@ -124,6 +129,28 @@ mod tests {
         );
     }
 
+    /// Nothing a program derives can be observed without an `.output` or
+    /// `.printsize`, so assembly rejects it before any later stage runs.
+    #[test]
+    fn collect_program_rejects_a_program_without_an_output_or_printsize() {
+        assert_err!(
+            collect_program(
+                ".decl E(x: number)\n.input E\n.decl R(x: number)\nR(x) :- E(x).\n",
+                FileId::new(0),
+            ),
+            ParseError::NoOutput
+        );
+    }
+
+    #[test]
+    fn a_printsize_alone_is_an_output() {
+        collect_program(
+            ".decl E(x: number)\n.input E\n.decl R(x: number)\n.printsize R\nR(x) :- E(x).\n",
+            FileId::new(0),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn collect_program_rejects_duplicate_extern_fn() {
         assert_err!(
@@ -137,7 +164,7 @@ mod tests {
 
     #[rstest]
     fn top_level_decl_resolves_component_subtype(#[values(true, false)] declaration_first: bool) {
-        let declaration = ".decl Out(x: c.Context)";
+        let declaration = ".decl Out(x: c.Context)\n.output Out";
         let component = ".comp C { .type Context <: symbol }\n.init c = C";
         let source = if declaration_first {
             format!("{declaration}\n{component}")
@@ -160,7 +187,7 @@ mod tests {
     #[test]
     fn top_level_declarations_keep_their_order_before_component_declarations() {
         let program = collect_program(
-            ".decl Before(x: number)\n\
+            ".decl Before(x: number)\n.output Before\n\
              .comp C { .decl Inner(x: number) }\n.init c = C\n\
              .decl After(x: number)",
             FileId::new(0),

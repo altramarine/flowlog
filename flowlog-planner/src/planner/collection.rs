@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use flowlog_parser::Mutability;
+
 use crate::planner::CanonicalForm;
 use crate::planner::KeyValueLayout;
 
@@ -35,22 +37,28 @@ pub struct Collection {
     /// built it. Where the fingerprint says which node this is, the form
     /// says what rows it holds, so equal forms are what sharing acts on.
     canonical: CanonicalForm,
+
+    /// How the rows change after the first epoch, determined by the
+    /// relations `canonical` reads and negates.
+    mutability: Mutability,
 }
 
 impl Collection {
     /// Creates a new collection with the given fingerprint, name, layout,
-    /// and canonical form.
+    /// canonical form, and the mutability that form determines.
     pub(crate) fn new(
         fingerprint: u64,
         name: String,
         kv_layout: KeyValueLayout,
         canonical: CanonicalForm,
+        mutability: Mutability,
     ) -> Self {
         Self {
             fingerprint,
             name,
             kv_layout,
             canonical,
+            mutability,
         }
     }
 
@@ -73,6 +81,28 @@ impl Collection {
     /// Returns the query this collection computes.
     pub(crate) fn canonical(&self) -> &CanonicalForm {
         &self.canonical
+    }
+
+    /// Returns how this collection's rows change after the first epoch.
+    #[must_use]
+    pub fn mutability(&self) -> Mutability {
+        self.mutability
+    }
+
+    /// This collection held as rows: the same columns, keys first, with no
+    /// key. The fingerprint stays, since the rows are the same plan node.
+    pub(crate) fn unkeyed(&self) -> Self {
+        let layout = &self.kv_layout;
+        Self {
+            fingerprint: self.fingerprint,
+            name: self.name.clone(),
+            kv_layout: KeyValueLayout::new(
+                Vec::new(),
+                layout.key().iter().chain(layout.value()).cloned().collect(),
+            ),
+            canonical: self.canonical.unkeyed(),
+            mutability: self.mutability,
+        }
     }
 }
 

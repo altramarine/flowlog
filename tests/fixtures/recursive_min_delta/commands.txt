@@ -1,0 +1,8 @@
+begin
+insert edge @Edge.csv
+insert source 1
+commit
+begin
+delete edge 3,2,1
+commit
+quit

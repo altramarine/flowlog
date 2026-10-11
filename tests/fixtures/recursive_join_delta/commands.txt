@@ -1,0 +1,15 @@
+begin
+insert edge 1,2
+insert edge 2,3
+insert edge 3,4
+insert edge 4,5
+insert allowed 1
+insert allowed 2
+insert allowed 3
+insert allowed 4
+insert allowed 5
+commit
+begin
+delete allowed 3
+commit
+quit

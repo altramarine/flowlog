@@ -1,0 +1,7 @@
+begin
+insert data @Data.csv
+commit
+begin
+delete data @Delete.csv
+commit
+quit

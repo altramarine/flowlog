@@ -1,0 +1,19 @@
+begin
+commit
+begin
+insert item alpha
+insert item beta
+insert amount 7
+insert amount -2
+commit
+begin
+delete item alpha
+delete item beta
+delete amount 7
+delete amount -2
+commit
+begin
+insert item gamma
+insert amount 9
+commit
+quit

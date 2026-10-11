@@ -67,3 +67,16 @@ crate in the workspace.
    `foo/` directory for its children; do not create a separate file solely
    to hold a small central contract. `lib.rs` remains limited to module
    declarations and re-exports.
+
+8. **Generated code allows only the lints the user's program causes.**
+   Every `allow` on generated code names one lint, and that lint must be
+   one codegen cannot satisfy because it is driven by user input:
+   `non_snake_case` and `non_camel_case_types` on identifiers derived from
+   user-chosen relation names (DOOP's `_MethodLookup_*`). Each such allow
+   is scoped as narrowly as possible and carries a comment naming the
+   cause. Every other warning, rustc or clippy, is a generator bug: an
+   `unused_variables` is a binding nothing reads, a `dead_code` is a
+   lifecycle method emitted for a relation that does not need it, a
+   `clone_on_copy` is a clone emitted without consulting the column's
+   type. Fix the generator, never widen the allow, and never emit a
+   blanket group such as `clippy::all` or `unused`.

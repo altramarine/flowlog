@@ -1,0 +1,11 @@
+begin
+delete seed 1
+commit
+begin
+insert seed 1
+delete seed @input.sqlite
+commit
+begin
+insert seed @input.sqlite
+commit
+quit

@@ -1,0 +1,11 @@
+begin
+insert seed 2
+insert seed 3
+insert link 1,7
+commit
+begin
+delete seed 2
+delete seed 3
+delete link 1,7
+commit
+quit

@@ -1,0 +1,15 @@
+begin
+insert data 1,10
+insert data 2,20
+insert data 3,30
+commit
+begin
+insert data 4,40
+delete data 2,20
+commit
+begin
+insert data 5,50
+delete data 1,10
+delete data 3,30
+commit
+quit

@@ -1,0 +1,4 @@
+begin
+insert data @Data.csv
+commit
+quit

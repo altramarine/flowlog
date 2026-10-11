@@ -1,5 +1,6 @@
 //! Stratum planner that plans a stratum (a group of rules).
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -10,6 +11,7 @@ use flowlog_common::SUBSECTION_BAR;
 use flowlog_parser::AggregationOperator;
 use flowlog_parser::FlowLogRule;
 use flowlog_parser::HeadArg;
+use flowlog_parser::Mutability;
 use flowlog_parser::Program;
 use flowlog_profiler::PlanGraph;
 use flowlog_profiler::with_plan_graph;
@@ -72,6 +74,10 @@ pub struct StratumPlanner {
     /// stratum construction so codegen can tell which transformation inputs
     /// are named atoms without re-walking the rule planners.
     atom_fps: HashSet<u64>,
+
+    /// The mutability of every relation the stratum reads or produces,
+    /// keyed by fingerprint.
+    mutabilities: BTreeMap<u64, Mutability>,
 }
 
 impl StratumPlanner {
@@ -146,9 +152,10 @@ impl StratumPlanner {
             planner.post(catalog)?;
         }
 
-        // Phase 6 materializes each rule's pipeline and derives every canonical form.
+        // Phase 6 materializes each rule's pipeline and derives every
+        // collection's canonical form and mutability.
         for planner in rule_planners.iter_mut() {
-            planner.materialize()?;
+            planner.materialize(&|fp| stratified.mutability(fp))?;
         }
 
         // Debug info for per-rule plan trees
@@ -204,6 +211,7 @@ impl StratumPlanner {
             idb_to_heads_map,
             idb_to_aggregation_map,
             atom_fps,
+            mutabilities: stratified.mutabilities().clone(),
             ..Self::default()
         };
         stratum_planner.dedup_transformations(preludes)?;
@@ -298,6 +306,18 @@ impl StratumPlanner {
     #[inline]
     pub fn is_recursive(&self) -> bool {
         self.is_recursive
+    }
+
+    /// Returns the mutability of a relation this stratum reads or produces,
+    /// or `None` for a relation it does not touch.
+    ///
+    /// A relation it reads has its final value. A relation it produces has
+    /// the value of everything produced for it up to this stratum, so a
+    /// relation whose rules span strata can have a lower value in an earlier
+    /// one. Every head of a recursive stratum has the same value.
+    #[must_use]
+    pub fn mutability(&self, relation_fp: u64) -> Option<Mutability> {
+        self.mutabilities.get(&relation_fp).copied()
     }
 
     /// Test-only: per-rule transformations before cross-rule dedup.
@@ -517,28 +537,19 @@ impl StratumPlanner {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use flowlog_common::Config;
     use flowlog_common::SourceMap;
-    use tempfile::NamedTempFile;
+    use flowlog_common::compute_fp;
 
     use super::*;
+    use crate::test_harness::program_planner;
 
     fn parse_rules(src: &str) -> (Vec<FlowLogRule>, SourceMap) {
-        let mut file = NamedTempFile::new().expect("tempfile");
-        file.write_all(src.as_bytes()).expect("write");
         let mut sources = SourceMap::new();
-        let mut config = Config::default();
-        let program = flowlog_parser::parse(
-            &file.path().to_string_lossy(),
-            &[],
-            &mut sources,
-            &mut config,
-        )
-        .expect("parse");
-        let rules = program.rules().to_vec();
-        (rules, sources)
+        let program =
+            flowlog_parser::test_harness::parse(src, &mut sources, &mut Config::default())
+                .expect("parse");
+        (program.rules().to_vec(), sources)
     }
 
     #[test]
@@ -616,5 +627,53 @@ mod tests {
             .expect("the first stratum should be valid");
         StratumPlanner::build_idb_to_aggregation_map(&rules[1..])
             .expect("the second stratum should be valid");
+    }
+
+    /// A planned stratum carries the stratifier's value for each relation it
+    /// reads or produces, and none for a relation it does not touch.
+    #[test]
+    fn stratum_reports_the_mutability_of_what_it_touches() {
+        let pp = program_planner(
+            "
+            .decl E(x: int32) mutable
+            .input E
+            .decl S(x: int32)
+            .input S
+            .decl A(x: int32)
+            A(x) :- S(x).
+            .decl B(x: int32)
+            B(x) :- A(x), E(x).
+            .output B
+            ",
+        );
+        let producing = |name: &str| {
+            pp.strata()
+                .iter()
+                .find(|stratum| stratum.idb_to_heads_map().contains_key(&compute_fp(name)))
+                .expect("a stratum produces the relation")
+        };
+        let (a, b) = (producing("a"), producing("b"));
+        let values = |stratum: &StratumPlanner| {
+            ["a", "b", "e", "s"].map(|name| stratum.mutability(compute_fp(name)))
+        };
+
+        assert_eq!(
+            values(a),
+            [
+                Some(Mutability::Static),
+                None,
+                None,
+                Some(Mutability::Static)
+            ]
+        );
+        assert_eq!(
+            values(b),
+            [
+                Some(Mutability::Static),
+                Some(Mutability::Mutable),
+                Some(Mutability::Mutable),
+                None
+            ]
+        );
     }
 }

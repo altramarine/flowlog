@@ -3,7 +3,6 @@
 
 use clap::Parser;
 use flowlog_common::Config;
-use flowlog_common::ExecutionMode;
 
 use crate::CompileOptions;
 
@@ -28,10 +27,6 @@ pub struct Cli {
     /// Use `-` for stdout. The executable's `-D` flag overrides it at runtime.
     #[arg(short = 'D', long, value_name = "DIR")]
     pub output_dir: Option<String>,
-
-    /// Execution strategy: `batch` (default) or `inc`.
-    #[arg(long, value_enum, default_value = "batch", value_name = "MODE")]
-    mode: ExecutionMode,
 
     /// Collect per-rule execution statistics (timing, tuple counts, ...).
     #[arg(long, short = 'P')]
@@ -89,7 +84,6 @@ impl Cli {
     pub fn to_config(&self) -> Config {
         Config {
             program: self.program.clone(),
-            mode: self.mode,
             profile: self.profile,
             str_intern: self.str_intern,
             group_join_outputs: self.group_join_outputs,

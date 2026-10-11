@@ -1,0 +1,11 @@
+begin
+insert block 2
+insert seed 1
+insert seed 2
+commit
+begin
+delete block 2
+insert block 3
+delete seed 1
+commit
+quit

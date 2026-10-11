@@ -6,7 +6,6 @@
 use differential_dataflow::AsCollection;
 use differential_dataflow::ExchangeData;
 use differential_dataflow::VecCollection;
-use differential_dataflow::difference::Present;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::hashable::Hashable;
 use differential_dataflow::lattice::Lattice;
@@ -23,7 +22,10 @@ use timely::order::Product;
 use timely::order::TotalOrder;
 use timely::progress::Timestamp;
 
-use super::dedup::Epoch;
+use super::dedup::Counter;
+use crate::diff;
+use crate::diff::Presence;
+use crate::time::LexLoop;
 
 /// Normalizes membership of complete `(key, value)` pairs. Exchange hashes
 /// only the key; different values under that key remain separate members.
@@ -38,10 +40,11 @@ pub trait FlowlogDedupByKey: Sized {
     fn dedup_by_key(self) -> Self;
 }
 
-impl<'scope, K, V> FlowlogDedupByKey for VecCollection<'scope, (), (K, V), Present>
+impl<'scope, K, V, R> FlowlogDedupByKey for VecCollection<'scope, (), (K, V), R>
 where
     K: ExchangeData + Hashable,
     V: ExchangeData,
+    R: Presence,
 {
     fn dedup_by_key(self) -> Self {
         self.arrange_by_key_named("Arrange: DedupByKey")
@@ -49,32 +52,35 @@ where
     }
 }
 
-impl<'scope, E: Epoch, K, V> FlowlogDedupByKey for VecCollection<'scope, E, (K, V), Present>
+impl<'scope, E: Counter, K, V, R> FlowlogDedupByKey for VecCollection<'scope, E, (K, V), R>
 where
     K: ExchangeData + Hashable,
     V: ExchangeData,
+    R: Presence,
 {
     fn dedup_by_key(self) -> Self {
-        threshold_by_key_total(self, |_, prior| prior.is_none().then_some(Present))
+        threshold_by_key_total(self, |_, prior| prior.is_none().then_some(R::one()))
     }
 }
 
-impl<'scope, I: Epoch, K, V> FlowlogDedupByKey
-    for VecCollection<'scope, Product<(), I>, (K, V), Present>
+impl<'scope, I: Counter, K, V, R> FlowlogDedupByKey
+    for VecCollection<'scope, Product<(), I>, (K, V), R>
 where
     K: ExchangeData + Hashable,
     V: ExchangeData,
+    R: Presence,
 {
     fn dedup_by_key(self) -> Self {
-        threshold_by_key_total(self, |_, prior| prior.is_none().then_some(Present))
+        threshold_by_key_total(self, |_, prior| prior.is_none().then_some(R::one()))
     }
 }
 
-impl<'scope, E: Epoch, I: Epoch, K, V> FlowlogDedupByKey
-    for VecCollection<'scope, Product<E, I>, (K, V), Present>
+impl<'scope, E: Counter, I: Counter, K, V, R> FlowlogDedupByKey
+    for VecCollection<'scope, Product<E, I>, (K, V), R>
 where
     K: ExchangeData + Hashable,
     V: ExchangeData,
+    R: Presence,
 {
     fn dedup_by_key(self) -> Self {
         first_pairs(self)
@@ -91,7 +97,7 @@ where
     }
 }
 
-impl<'scope, E: Epoch, K, V> FlowlogDedupByKey for VecCollection<'scope, E, (K, V), i32>
+impl<'scope, E: Counter, K, V> FlowlogDedupByKey for VecCollection<'scope, E, (K, V), i32>
 where
     K: ExchangeData + Hashable,
     V: ExchangeData,
@@ -101,7 +107,7 @@ where
     }
 }
 
-impl<'scope, I: Epoch, K, V> FlowlogDedupByKey
+impl<'scope, I: Counter, K, V> FlowlogDedupByKey
     for VecCollection<'scope, Product<(), I>, (K, V), i32>
 where
     K: ExchangeData + Hashable,
@@ -112,7 +118,7 @@ where
     }
 }
 
-impl<'scope, E: Epoch, I: Epoch, K, V> FlowlogDedupByKey
+impl<'scope, E: Counter, I: Counter, K, V> FlowlogDedupByKey
     for VecCollection<'scope, Product<E, I>, (K, V), i32>
 where
     K: ExchangeData + Hashable,
@@ -136,6 +142,27 @@ where
                 },
             )
             .as_collection(|key, value| (key.clone(), value.clone()))
+    }
+}
+
+impl<'scope, K, V, R> FlowlogDedupByKey for VecCollection<'scope, LexLoop, (K, V), R>
+where
+    K: ExchangeData + Hashable,
+    V: ExchangeData,
+    R: Presence,
+{
+    fn dedup_by_key(self) -> Self {
+        threshold_by_key_total(self, |_, prior| prior.is_none().then_some(R::one()))
+    }
+}
+
+impl<'scope, K, V> FlowlogDedupByKey for VecCollection<'scope, LexLoop, (K, V), diff::Mutable>
+where
+    K: ExchangeData + Hashable,
+    V: ExchangeData,
+{
+    fn dedup_by_key(self) -> Self {
+        threshold_by_key_total(self, membership_delta)
     }
 }
 
@@ -228,12 +255,13 @@ where
         .as_collection()
 }
 
-fn first_pairs<'scope, E: Epoch, I: Epoch, K, V>(
-    collection: VecCollection<'scope, Product<E, I>, (K, V), Present>,
-) -> VecCollection<'scope, Product<E, I>, (K, V), Present>
+fn first_pairs<'scope, E: Counter, I: Counter, K, V, R>(
+    collection: VecCollection<'scope, Product<E, I>, (K, V), R>,
+) -> VecCollection<'scope, Product<E, I>, (K, V), R>
 where
     K: ExchangeData + Hashable,
     V: ExchangeData,
+    R: Presence,
 {
     let arranged = collection.arrange_by_key_named("Arrange: DedupByKey");
     let mut trace = arranged.trace;
@@ -280,7 +308,7 @@ where
                                             session.give((
                                                 (key.clone(), value.clone()),
                                                 time.clone(),
-                                                Present,
+                                                R::one(),
                                             ));
                                         }
                                         least_inner = Some(time.inner);
@@ -308,6 +336,7 @@ mod tests {
     use timely::dataflow::operators::probe::Handle;
 
     use super::*;
+    use crate::diff::Static as Present;
 
     type Pair = (u64, char);
     type PairUpdate<R> = (Pair, u32, R);
@@ -455,6 +484,68 @@ mod tests {
                 ((1, 'b'), Product::new((), 0), Present),
                 ((1, 'c'), Product::new((), 1), Present),
                 ((1, 'd'), Product::new((), 2), Present),
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(diff::Static)]
+    #[case(diff::Append)]
+    fn lexicographic_presence_keeps_distinct_values_across_epochs<R: Presence + Sync>(
+        #[case] weight: R,
+    ) where
+        for<'scope> VecCollection<'scope, LexLoop, Pair, R>: FlowlogDedupByKey,
+    {
+        let mut actual = timely::execute_directly(move |worker| {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let probe = Handle::new();
+            let mut input = worker.dataflow::<u32, _, _>(|scope| {
+                let (input, seeds) = scope.new_collection::<Pair, R>();
+                let rows = scope.scoped::<LexLoop, _, _>("Iterative", |inner| {
+                    let (variable, feedback) =
+                        differential_dataflow::operators::iterate::Variable::new(
+                            inner,
+                            LexLoop::NEXT_ITERATION,
+                        );
+                    let step = feedback.map(|(key, value): Pair| {
+                        (
+                            key,
+                            if value < 'c' {
+                                char::from(value as u8 + 1)
+                            } else {
+                                'a'
+                            },
+                        )
+                    });
+                    let next = flowlog_dedup_by_key(seeds.enter(inner).concat(step));
+                    variable.set(next.clone());
+                    next.leave(scope)
+                });
+                let seen = Rc::clone(&seen);
+                rows.inspect(move |update| seen.borrow_mut().push(*update))
+                    .probe_with(&probe);
+                input
+            });
+            input.update((1, 'a'), weight);
+            input.advance_to(1);
+            input.flush();
+            while probe.less_than(input.time()) {
+                worker.step();
+            }
+            input.update((1, 'a'), weight);
+            input.update((1, 'd'), weight);
+            input.close();
+            while worker.step() {}
+            seen.take()
+        });
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                ((1, 'a'), 0, weight),
+                ((1, 'b'), 0, weight),
+                ((1, 'c'), 0, weight),
+                ((1, 'd'), 1, weight),
             ]
         );
     }

@@ -22,11 +22,13 @@ parser-specific.
 
 4. **Table-drive the matrices.** When one property must hold across many
    variants, use an rstest case table with one row per variant, and
-   bundle related predicates per row so they cannot drift apart:
+   bundle related predicates per row so they cannot drift apart. Name the
+   columns in one comment line, comma-separated, rather than aligning a
+   header and the rows with spaces:
 
    ```rust
-   //    type                is_integer  is_float  is_numeric  is_tuple
-   #[case(DataType::Float32, (false,     true,     true,       false))]
+   // Cases: type, (is_integer, is_float, is_numeric, is_tuple).
+   #[case(DataType::Float32, (false, true, true, false))]
    ```
 
 5. **Guard single-source tables by iterating them.** A test that loops
@@ -61,7 +63,7 @@ parser-specific.
     own block and treat lower layers as already-correct; never re-check a
     lower layer through a full pipeline run. Drive a unit through the
     smallest entry that can produce its input (in flowlog-parser,
-    `test_util::parse_node` runs the grammar from a single rule), and pin
+    `test_harness::parse_node` runs the grammar from a single rule), and pin
     each behavior at the lowest layer that can observe it.
 
 12. **Cover the negative space.** A contract is what it accepts and

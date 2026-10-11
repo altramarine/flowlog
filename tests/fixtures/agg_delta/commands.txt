@@ -1,0 +1,12 @@
+begin
+insert sale 1,10
+insert sale 1,20
+insert sale 2,30
+insert sale 2,40
+insert sale 2,50
+commit
+begin
+insert sale 1,5
+delete sale 2,40
+commit
+quit

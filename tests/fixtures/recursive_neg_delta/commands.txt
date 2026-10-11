@@ -1,0 +1,14 @@
+begin
+insert seed 1
+insert edge 1,2
+insert edge 2,3
+insert edge 3,4
+insert blocked 3
+commit
+begin
+delete blocked 3
+commit
+begin
+insert blocked 2
+commit
+quit

@@ -12,6 +12,7 @@ keywords = ["datalog", "dataflow", "compiler", "build-script"]
 categories = ["compilers", "database", "development-tools::build-utils"]
 
 [dependencies]
+flowlog-codegen.workspace = true
 flowlog-common.workspace = true
 flowlog-parser.workspace = true
 flowlog-planner.workspace = true
@@ -27,11 +28,10 @@ serde = { workspace = true }
 serde_json.workspace = true
 syn = { workspace = true, features = ["full"] }
 thiserror.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
+flowlog-parser = { workspace = true, features = ["_test-harness"] }
 rstest.workspace = true
-tempfile.workspace = true
 tracing-test.workspace = true
 
 [lints]
