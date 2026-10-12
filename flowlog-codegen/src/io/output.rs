@@ -115,9 +115,10 @@ impl Codegen {
         name: &str,
         mutability: Mutability,
     ) -> TokenStream {
-        // Presence inputs and rule heads already announce each row once.
-        // Counting needs signed weights, but no second membership trace.
-        // Mutable inputs can retain signed debt, so keep their threshold.
+        // Every relation's dedup already leaves a set: a presence relation
+        // announces each row once, and a mutable one's row changes sum to
+        // its membership. Counting therefore needs no second dedup, only a
+        // signed weight, which a presence must first lift to.
         let op_name = format!("{name}: inspect size");
         let counted = match mutability {
             Mutability::Static | Mutability::Append => quote! {
@@ -125,9 +126,7 @@ impl Codegen {
                     #collection.clone(), #op_name,
                 )
             },
-            Mutability::Mutable => quote! {
-                ::flowlog_runtime::operators::flowlog_dedup(#collection.clone())
-            },
+            Mutability::Mutable => quote! { #collection.clone() },
         };
         let probe = self.gen_probe();
 
@@ -309,7 +308,7 @@ mod tests {
         " mutable",
         quote! {{
             let emitter_r = emitter_r.clone();
-            ::flowlog_runtime::operators::flowlog_dedup(r.clone())
+            r.clone()
                 .map(|_| ())
                 .consolidate()
                 .inspect(move |(_data, time, size)| {

@@ -127,16 +127,15 @@ pub(crate) const STATIC_AGGREGATE: u32 = ONE + THRESHOLD_TOTAL + ONE;
 /// weights collapsed across iterations: `.consolidate()` then a Map back.
 pub(crate) const POST_LEAVE_STATIC_AGGREGATE: u32 = CONSOLIDATE + ONE;
 
-/// Operators in `gen_size_inspector`, in build order: a mutable relation's
-/// dedup or a presence relation's lift to an `i32` report weight, the
-/// collapse onto one key, its consolidation, the inspect, and an
-/// incremental engine's probe.
+/// Operators in `gen_size_inspector`, in build order: a presence relation's
+/// lift to an `i32` report weight, the collapse onto one key, its
+/// consolidation, the inspect, and an incremental engine's probe.
 pub(crate) fn inspect_size(mutability: Mutability, incremental: bool) -> u32 {
-    let membership = match mutability {
+    let lift = match mutability {
         Mutability::Static | Mutability::Append => ONE,
-        Mutability::Mutable => dedup(mutability, false),
+        Mutability::Mutable => 0,
     };
-    membership + ONE + CONSOLIDATE + ONE + probe(incremental)
+    lift + ONE + CONSOLIDATE + ONE + probe(incremental)
 }
 
 /// Operators in content inspectors (terminal/file), in build order: a
@@ -219,7 +218,7 @@ mod tests {
     #[case(Mutability::Static, false, (6, 1))]
     #[case(Mutability::Static, true, (7, 2))]
     #[case(Mutability::Append, true, (7, 2))]
-    #[case(Mutability::Mutable, true, (9, 5))]
+    #[case(Mutability::Mutable, true, (6, 5))]
     fn reports_follow_the_relations_weight_and_engine(
         #[case] mutability: Mutability,
         #[case] incremental: bool,
