@@ -74,6 +74,14 @@ impl RulePlanner {
 
         // We default here assume the input layout is all values from the first positive atom.
         // No additional mapping is needed.
+        //
+        // A head that reads the atom column for column gets this step too,
+        // although it only copies the rows. Codegen emits the copy as an
+        // alias of its input, so it costs nothing at run time, while the
+        // stratum derives its loop from the transformations alone: which
+        // collections enter it, which steps run inside it, and the weight
+        // it runs at. A rule without a step would be a read the stratum
+        // cannot see, and a loop of such rules would have no body at all.
         let (input_fp, input_kv_layout) = (
             catalog.positive_atom_fingerprint(0)?,
             KeyValueLayout::new(
@@ -158,7 +166,8 @@ impl RulePlanner {
 
     /// Resolve head arguments (variables, arithmetic expressions, aggregation,
     /// UDF) into [`ArithmeticPos`]. Aggregation arguments lower to their inner
-    /// arithmetic; the aggregate itself is planned per stratum.
+    /// arithmetic; the reduce itself is the rule's last step, added when the
+    /// pipeline is materialized.
     fn resolve_head_arguments(
         catalog: &Catalog,
         name_to_sig: &HashMap<String, AtomArgumentSignature>,

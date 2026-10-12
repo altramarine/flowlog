@@ -11,7 +11,7 @@
 //!   collections to the emitters its outputs publish through.
 //! - `stratum`: the dataflow's strata in order, each non-recursive or
 //!   recursive.
-//! - `rule`: a rule's head and body steps, shared by both kinds of stratum.
+//! - `operator`: planned steps, shared by both kinds of stratum.
 //! - `expr`: the expressions inside operator closures.
 //! - `ty`: the `(Data, Diff, Time)` types every collection carries.
 //! - `ident`, `error`, `profiling`: binding idents, internal errors, and the
@@ -21,8 +21,8 @@ mod error;
 mod expr;
 mod ident;
 mod io;
+mod operator;
 mod profiling;
-mod rule;
 mod skeleton;
 mod stratum;
 #[cfg(test)]
@@ -54,7 +54,7 @@ pub use ty::data::user_tuple_tokens;
 pub use ty::diff::weight_tokens;
 
 pub struct Codegen {
-    pub(crate) head_output_layouts: rule::head_layout::HeadOutputLayouts,
+    pub(crate) head_output_layouts: operator::head_layout::HeadOutputLayouts,
     pub(crate) config: Config,
     pub(crate) program: Program,
 
@@ -102,7 +102,7 @@ impl Codegen {
         plan_graph: &mut Option<PlanGraph>,
     ) -> Result<Skeleton, CodegenError> {
         self.head_output_layouts = if self.config.group_join_outputs {
-            rule::head_layout::HeadOutputLayouts::from_plan(program_planner)
+            operator::head_layout::HeadOutputLayouts::from_plan(program_planner)
         } else {
             Default::default()
         };

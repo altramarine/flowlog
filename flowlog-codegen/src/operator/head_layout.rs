@@ -118,10 +118,10 @@ impl HeadOutputLayouts {
                     })
                     .or_else(|| {
                         let step = head_steps.first()?;
-                        let arity = step.flow().value().len();
+                        let arity = step.output().arity().1;
                         // Without a retained join-side group, preserve column
-                        // order and split it in half. This still groups values
-                        // under a shorter key, but its partition can be skewed.
+                        // order and split it in half to shorten the trace key.
+                        // Complete pairs still determine worker placement.
                         (arity >= 2).then(|| HeadOutputLayout {
                             key_columns: (0..arity / 2).collect(),
                             value_columns: (arity / 2..arity).collect(),
