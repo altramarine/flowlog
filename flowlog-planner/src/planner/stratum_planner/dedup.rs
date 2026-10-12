@@ -678,6 +678,7 @@ mod tests {
     use crate::planner::StratumPlanner;
     use crate::planner::Transformation;
     use crate::planner::TransformationArgument;
+    use crate::planner::TransformationFlow;
     use crate::test_harness::program_planner;
 
     const WIDE_NARROW: &str = "\
@@ -850,6 +851,88 @@ mod tests {
         assert_eq!(stratum.non_recursive_transformations().len(), 3);
     }
 
+    /// A rule whose head aggregates ends in a reduce over the rows its
+    /// body derives, and those rows are shared like any other: Deg's
+    /// reduce reads the join Pair's head is, so the join runs once.
+    #[test]
+    fn an_aggregating_rule_reduces_the_rows_a_plain_rule_shares() {
+        let pp = program_planner(
+            "\
+            .decl Edge(x: int32, y: int32)\n\
+            .decl Node(x: int32)\n\
+            .decl Deg(x: int32, n: int32)\n\
+            .decl Pair(x: int32, y: int32)\n\
+            .input Edge(IO=\"file\", filename=\"Edge.csv\", delimiter=\",\")\n\
+            .input Node(IO=\"file\", filename=\"Node.csv\", delimiter=\",\")\n\
+            .output Deg\n\
+            .output Pair\n\
+            Deg(x, count(y)) :- Edge(x, y), Node(x).\n\
+            Pair(x, y) :- Edge(x, y), Node(x).\n",
+        );
+        let stratum = &pp.strata()[0];
+        let txs = stratum.non_recursive_transformations();
+        let [deg_head] = stratum.idb_to_heads_map()[&compute_fp("deg")][..] else {
+            panic!("Deg has one head");
+        };
+        let [pair_head] = stratum.idb_to_heads_map()[&compute_fp("pair")][..] else {
+            panic!("Pair has one head");
+        };
+
+        let reduce = txs
+            .iter()
+            .find(|tx| tx.output().fingerprint() == deg_head)
+            .expect("Deg's head is produced");
+        assert!(matches!(
+            reduce,
+            Transformation::RowToRow {
+                flow: TransformationFlow::Reduce { .. },
+                ..
+            }
+        ));
+        assert_eq!(reduce.unary_input().fingerprint(), pair_head);
+        assert_eq!(txs.iter().filter(|tx| !tx.is_unary()).count(), 1);
+        assert!(producers_precede_readers(stratum));
+    }
+
+    /// Rules aggregating the same rows end in reduces over one shared
+    /// collection, one reduce per rule: a different operator is a
+    /// different answer, and so is the same operator for another relation,
+    /// whose declaration may type the answer differently.
+    #[test]
+    fn reduces_share_their_rows_but_answer_per_relation() {
+        let pp = program_planner(
+            "\
+            .decl Orders(id: int32, amount: int32)\n\
+            .decl Total(n: int32)\n\
+            .decl Count(n: int32)\n\
+            .decl Again(n: int32)\n\
+            .input Orders(IO=\"file\", filename=\"Orders.csv\", delimiter=\",\")\n\
+            .output Total\n\
+            .output Count\n\
+            .output Again\n\
+            Total(sum(amount)) :- Orders(_, amount).\n\
+            Count(count(amount)) :- Orders(_, amount).\n\
+            Again(count(amount)) :- Orders(_, amount).\n",
+        );
+        let stratum = &pp.strata()[0];
+        let txs = stratum.non_recursive_transformations();
+        let head = |name: &str| stratum.idb_to_heads_map()[&compute_fp(name)][0];
+
+        assert_ne!(head("total"), head("count"));
+        assert_ne!(head("count"), head("again"));
+        let reduces: Vec<_> = txs
+            .iter()
+            .filter(|tx| tx.flow().aggregate().is_some())
+            .collect();
+        assert_eq!(reduces.len(), 3);
+        let inputs: HashSet<u64> = reduces
+            .iter()
+            .map(|tx| tx.unary_input().fingerprint())
+            .collect();
+        assert_eq!(inputs.len(), 1);
+        assert!(producers_precede_readers(stratum));
+    }
+
     /// Both rules output the same computed string over the same join, and
     /// Label also carries a column the string is built from. Full has no
     /// plain column that spells the string, but Label outputs that very
@@ -886,10 +969,10 @@ mod tests {
         assert!(producers_precede_readers(stratum));
     }
 
-    /// Copy's head and the product's arrangement of `A` compute the same
-    /// rows, but one is rows and the other is arranged under an empty key.
-    /// Neither may stand for the other: the join must still read an
-    /// arranged input, so both stay.
+    /// Copy's head, the relation `A` itself, and the product's arrangement
+    /// of `A` hold the same rows, but one is rows and the other is arranged
+    /// under an empty key. Neither may stand for the other: the join must
+    /// still read an arranged input, so the arrangement stays.
     #[test]
     fn a_row_head_does_not_stand_for_an_arrangement_with_an_empty_key() {
         let pp = program_planner(
@@ -921,12 +1004,8 @@ mod tests {
             assert!(producer.need_arrange());
             assert_ne!(input.fingerprint(), copy_head);
         }
-        let copy = txs
-            .iter()
-            .find(|tx| tx.output().fingerprint() == copy_head)
-            .expect("Copy's head is still produced");
-        assert!(!copy.need_arrange());
-        assert_eq!(txs.len(), 4);
+        assert_eq!(copy_head, compute_fp("a"));
+        assert_eq!(txs.len(), 3);
     }
 
     /// Both's join of `R` and `S` is arranged under `k` alone, with no
@@ -1067,12 +1146,12 @@ mod tests {
         let pp = program_planner(
             "\
             .decl S(k: int32, b: int32, c: int32)\n\
-            .decl Wide(k: int32, b: int32, c: int32)\n\
+            .decl Wide(k: int32, c: int32, b: int32)\n\
             .decl Narrow(k: int32, b: int32)\n\
             .input S(IO=\"file\", filename=\"S.csv\", delimiter=\",\")\n\
             .output Wide\n\
             .output Narrow\n\
-            Wide(k, b, c) :- S(k, b, c).\n\
+            Wide(k, c, b) :- S(k, b, c).\n\
             Narrow(k, b) :- S(k, b, _).\n",
         );
         let txs = pp.strata()[0].non_recursive_transformations();

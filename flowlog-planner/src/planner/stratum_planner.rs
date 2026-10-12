@@ -8,9 +8,7 @@ use std::mem;
 
 use flowlog_common::SECTION_BAR;
 use flowlog_common::SUBSECTION_BAR;
-use flowlog_parser::AggregationOperator;
 use flowlog_parser::FlowLogRule;
-use flowlog_parser::HeadArg;
 use flowlog_parser::Mutability;
 use flowlog_parser::Program;
 use flowlog_profiler::PlanGraph;
@@ -61,14 +59,11 @@ pub struct StratumPlanner {
     recursion_leave_collections: Vec<u64>,
 
     /// The collections whose rows each relation of this stratum unions:
-    /// one per rule as planned, fewer once sharing lets one collection
-    /// stand for several heads. Codegen concatenates them per relation.
+    /// one per rule as planned, the reduce's answers for a rule whose head
+    /// aggregates, the relation itself for a rule that reads one as it is,
+    /// fewer once sharing lets one collection stand for several heads.
+    /// Codegen concatenates them per relation.
     idb_to_heads_map: HashMap<u64, Vec<u64>>,
-
-    /// Aggregation metadata keyed by IDB fingerprint.
-    /// Only populated for rules whose heads contain an aggregation argument.
-    /// Values are `(AggregationOperator, output_position, output_arity)`.
-    idb_to_aggregation_map: HashMap<u64, (AggregationOperator, usize, usize)>,
 
     /// Atom fingerprints unioned across every rule's rhs. Computed once at
     /// stratum construction so codegen can tell which transformation inputs
@@ -97,7 +92,6 @@ impl StratumPlanner {
             .iter()
             .map(|&rule_id| rules[rule_id].clone())
             .collect();
-        let idb_to_aggregation_map = Self::build_idb_to_aggregation_map(&stratum)?;
         let is_recursive = stratified.is_recursive();
         let mut catalogs = Vec::with_capacity(stratum.len());
         let mut rule_planners = Vec::with_capacity(stratum.len());
@@ -154,8 +148,8 @@ impl StratumPlanner {
 
         // Phase 6 materializes each rule's pipeline and derives every
         // collection's canonical form and mutability.
-        for planner in rule_planners.iter_mut() {
-            planner.materialize(&|fp| stratified.mutability(fp))?;
+        for (planner, catalog) in rule_planners.iter_mut().zip(catalogs.iter()) {
+            planner.materialize(catalog, &|fp| stratified.mutability(fp))?;
         }
 
         // Debug info for per-rule plan trees
@@ -192,16 +186,19 @@ impl StratumPlanner {
             .iter()
             .flat_map(RulePlanner::rhs_atom_fps)
             .collect();
-        // Each rule's last transformation is its head; dedup rewrites the
-        // map as it merges heads or serves one from another collection.
+        // A rule's head is its last step's output, or the relation it reads
+        // as it is when it has no step. Dedup rewrites the map as it merges
+        // heads or serves one from another collection.
         let mut idb_to_heads_map: HashMap<u64, Vec<u64>> = HashMap::new();
         for (catalog, planner) in catalogs.iter().zip(&rule_planners) {
-            if let Some(head) = planner.transformations().last() {
-                idb_to_heads_map
-                    .entry(catalog.head_idb_fingerprint())
-                    .or_default()
-                    .push(head.output().fingerprint());
-            }
+            let head = match planner.transformations().last() {
+                Some(last) => last.output().fingerprint(),
+                None => catalog.positive_atom_fingerprint(0)?,
+            };
+            idb_to_heads_map
+                .entry(catalog.head_idb_fingerprint())
+                .or_default()
+                .push(head);
         }
         let mut stratum_planner = Self {
             rule_planners,
@@ -209,7 +206,6 @@ impl StratumPlanner {
             recursion_feedback_collections: stratified.recursive_relations().to_vec(),
             recursion_leave_collections: stratified.leave_relations().to_vec(),
             idb_to_heads_map,
-            idb_to_aggregation_map,
             atom_fps,
             mutabilities: stratified.mutabilities().clone(),
             ..Self::default()
@@ -282,14 +278,6 @@ impl StratumPlanner {
     #[inline]
     pub fn idb_to_heads_map(&self) -> &HashMap<u64, Vec<u64>> {
         &self.idb_to_heads_map
-    }
-
-    /// Get the mapping from IDB fingerprint to corresponding aggregation.
-    /// Returns tuples of `(AggregationOperator, position in output relation,
-    /// output arity)`.
-    #[inline]
-    pub fn idb_to_aggregation_map(&self) -> &HashMap<u64, (AggregationOperator, usize, usize)> {
-        &self.idb_to_aggregation_map
     }
 
     /// Map of atom fingerprint to `"name(arg1, ..., argN)"` label for every
@@ -366,18 +354,6 @@ impl fmt::Display for StratumPlanner {
             }
         } else {
             writeln!(f, "(Non-recursive stratum: no recursive transformations)")?;
-        }
-
-        if !self.idb_to_aggregation_map.is_empty() {
-            writeln!(f, "\n{}", SUBSECTION_BAR)?;
-            writeln!(f, "IDB to Aggregation Map:")?;
-            for (fp, (op, pos, arity)) in &self.idb_to_aggregation_map {
-                writeln!(
-                    f,
-                    "  fp=0x{:016x},\n  op={:?},\n  pos={},\n  arity={}",
-                    fp, op, pos, arity
-                )?;
-            }
         }
 
         writeln!(f, "{}", SECTION_BAR)
@@ -479,56 +455,6 @@ impl StratumPlanner {
             .copied()
             .collect()
     }
-
-    /// Returns aggregation metadata after checking compatibility within one
-    /// stratum.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlanError::InconsistentAggregation`] when rules deriving the
-    /// same relation use different aggregation operators or head positions.
-    fn build_idb_to_aggregation_map(
-        rules: &[FlowLogRule],
-    ) -> Result<HashMap<u64, (AggregationOperator, usize, usize)>, PlanError> {
-        let mut aggregations = HashMap::new();
-        let mut first_spans = HashMap::new();
-
-        for rule in rules {
-            let head = rule.head();
-            let head_args = head.head_arguments();
-            let Some((pos, op)) = head_args.iter().enumerate().find_map(|(i, arg)| match arg {
-                HeadArg::Aggregation(agg) => Some((i, *agg.operator())),
-                HeadArg::Var(_) | HeadArg::Arith(_) => None,
-            }) else {
-                continue;
-            };
-
-            let arity = head_args.len();
-            let head_idb_fp = head.head_fingerprint();
-
-            match aggregations.get(&head_idb_fp) {
-                Some(&(existing_op, existing_pos, _))
-                    if (existing_op, existing_pos) != (op, pos) =>
-                {
-                    return Err(PlanError::InconsistentAggregation {
-                        head_span: head.span(),
-                        prior_head_span: first_spans[&head_idb_fp],
-                        rel: head.raw_name().to_string(),
-                        existing_op,
-                        existing_pos,
-                        found_op: op,
-                        found_pos: pos,
-                    });
-                }
-                None => {
-                    aggregations.insert(head_idb_fp, (op, pos, arity));
-                    first_spans.insert(head_idb_fp, head.span());
-                }
-                Some(_) => {}
-            }
-        }
-        Ok(aggregations)
-    }
 }
 
 // =============================================================================
@@ -537,96 +463,49 @@ impl StratumPlanner {
 
 #[cfg(test)]
 mod tests {
-    use flowlog_common::Config;
-    use flowlog_common::SourceMap;
     use flowlog_common::compute_fp;
 
     use super::*;
     use crate::test_harness::program_planner;
 
-    fn parse_rules(src: &str) -> (Vec<FlowLogRule>, SourceMap) {
-        let mut sources = SourceMap::new();
-        let program =
-            flowlog_parser::test_harness::parse(src, &mut sources, &mut Config::default())
-                .expect("parse");
-        (program.rules().to_vec(), sources)
+    /// A rule reading one relation as it is has no step: its head is the
+    /// relation, and the stratum unions that.
+    #[test]
+    fn a_copying_rule_has_the_relation_for_its_head() {
+        let pp = program_planner(
+            "\
+            .decl In(x: int32, y: int32)\n\
+            .decl Out(x: int32, y: int32)\n\
+            .input In(IO=\"file\", filename=\"In.csv\", delimiter=\",\")\n\
+            .output Out\n\
+            Out(x, y) :- In(x, y).\n",
+        );
+        let stratum = &pp.strata()[0];
+        assert!(stratum.non_recursive_transformations().is_empty());
+        assert_eq!(
+            stratum.idb_to_heads_map()[&compute_fp("out")],
+            vec![compute_fp("in")]
+        );
     }
 
+    /// A rule aggregating a relation read as it is reduces the relation
+    /// itself, with no step in between.
     #[test]
-    fn conflicting_aggregation_operators_in_one_stratum_are_rejected() {
-        let src = "\
-            .decl Orders(id: int32, amount: int32)\n\
-            .decl Totals(total: int32)\n\
-            .input Orders(IO=\"file\", filename=\"Orders.csv\", delimiter=\",\")\n\
-            .output Totals\n\
-            Totals(sum(amount)) :- Orders(id, amount).\n\
-            Totals(max(amount)) :- Orders(id, amount).\n";
-        let (rules, sources) = parse_rules(src);
-
-        let err = StratumPlanner::build_idb_to_aggregation_map(&rules)
-            .expect_err("one stratum must use one aggregation shape");
-        let PlanError::InconsistentAggregation {
-            head_span,
-            prior_head_span,
-            rel,
-            existing_op,
-            existing_pos,
-            found_op,
-            found_pos,
-        } = err
-        else {
-            panic!("expected inconsistent aggregation, got {err}");
+    fn a_reduce_over_a_relation_reads_the_relation() {
+        let pp = program_planner(
+            "\
+            .decl Cand(node: int32, d: int32)\n\
+            .decl Dist(node: int32, d: int32)\n\
+            .input Cand(IO=\"file\", filename=\"Cand.csv\", delimiter=\",\")\n\
+            .output Dist\n\
+            Dist(n, min(d)) :- Cand(n, d).\n",
+        );
+        let stratum = &pp.strata()[0];
+        let [reduce] = stratum.non_recursive_transformations() else {
+            panic!("the reduce is the only step");
         };
-
-        assert_eq!(rel, "Totals");
-        assert_eq!(existing_op, AggregationOperator::Sum);
-        assert_eq!(existing_pos, 0);
-        assert_eq!(found_op, AggregationOperator::Max);
-        assert_eq!(found_pos, 0);
-        assert_eq!(sources.snippet(prior_head_span), "Totals(sum(amount))");
-        assert_eq!(sources.snippet(head_span), "Totals(max(amount))");
-    }
-
-    #[test]
-    fn conflicting_aggregation_positions_in_one_stratum_are_rejected() {
-        let src = "\
-            .decl Orders(id: int32, amount: int32)\n\
-            .decl Totals(left: int32, right: int32)\n\
-            .input Orders(IO=\"file\", filename=\"Orders.csv\", delimiter=\",\")\n\
-            .output Totals\n\
-            Totals(id, sum(amount)) :- Orders(id, amount).\n\
-            Totals(sum(amount), id) :- Orders(id, amount).\n";
-        let (rules, _) = parse_rules(src);
-
-        let err = StratumPlanner::build_idb_to_aggregation_map(&rules)
-            .expect_err("one stratum must use one aggregation position");
-        assert!(matches!(
-            err,
-            PlanError::InconsistentAggregation {
-                existing_op: AggregationOperator::Sum,
-                existing_pos: 1,
-                found_op: AggregationOperator::Sum,
-                found_pos: 0,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn different_strata_may_use_different_aggregation_shapes() {
-        let src = "\
-            .decl Orders(id: int32, amount: int32)\n\
-            .decl Totals(total: int32)\n\
-            .input Orders(IO=\"file\", filename=\"Orders.csv\", delimiter=\",\")\n\
-            .output Totals\n\
-            Totals(sum(amount)) :- Orders(id, amount).\n\
-            Totals(max(amount)) :- Orders(id, amount).\n";
-        let (rules, _) = parse_rules(src);
-
-        StratumPlanner::build_idb_to_aggregation_map(&rules[..1])
-            .expect("the first stratum should be valid");
-        StratumPlanner::build_idb_to_aggregation_map(&rules[1..])
-            .expect("the second stratum should be valid");
+        assert!(reduce.flow().aggregate().is_some());
+        assert_eq!(reduce.unary_input().fingerprint(), compute_fp("cand"));
     }
 
     /// A planned stratum carries the stratifier's value for each relation it
