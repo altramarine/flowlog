@@ -9,3 +9,4 @@
 .decl Out(src: int32, dst: int32)
 Out(s, d) :- Edge(s, d).
 .output Out
+.printsize Out

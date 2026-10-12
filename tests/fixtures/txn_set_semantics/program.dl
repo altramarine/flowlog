@@ -12,4 +12,3 @@
 .decl Out(x: int32)
 Out(x) :- E(x).
 .output Out
-.printsize Out
