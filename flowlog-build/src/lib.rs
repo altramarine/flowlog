@@ -86,7 +86,6 @@ pub fn compile<P: AsRef<Path>>(program_path: P) -> io::Result<()> {
 #[derive(Default)]
 pub struct Builder {
     pub(crate) string_intern: bool,
-    pub(crate) group_join_outputs: bool,
     pub(crate) profile: bool,
     pub(crate) include_dirs: Vec<PathBuf>,
     pub(crate) udf_file: Option<PathBuf>,
@@ -98,13 +97,6 @@ impl Builder {
     /// interning is applied at `insert_<rel>` / drain.
     pub fn string_intern(mut self, enabled: bool) -> Self {
         self.string_intern = enabled;
-        self
-    }
-
-    /// Deduplicate rule heads as key-value pairs, sharded by the complete pair.
-    /// Disabled by default.
-    pub fn group_join_outputs(mut self, enabled: bool) -> Self {
-        self.group_join_outputs = enabled;
         self
     }
 

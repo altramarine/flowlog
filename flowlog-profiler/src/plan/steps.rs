@@ -47,15 +47,6 @@ pub(crate) fn arrange(is_key_only: bool) -> u32 {
     if is_key_only { 2 * ONE } else { ONE }
 }
 
-/// Key-value normalization adds arrangement and threshold or conversion.
-/// Mutable recursive products also convert the reduced collection.
-pub(crate) fn dedup_by_key(mutability: Mutability, recursive: bool) -> u32 {
-    match (mutability, recursive) {
-        (Mutability::Static | Mutability::Append, _) | (Mutability::Mutable, false) => 2,
-        (Mutability::Mutable, true) => 3,
-    }
-}
-
 /// Operators from `flowlog_dedup` on a collection of weight `mutability`,
 /// in a recursive scope when `recursive`. Presence dedups through a
 /// total-clock threshold or `first_occurrences` wherever it runs. A signed

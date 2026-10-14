@@ -11,10 +11,6 @@ pub struct Config {
     pub profile: bool,
     /// Intern string columns as compact integer keys at load time.
     pub str_intern: bool,
-    /// Deduplicate rule heads by key-value grouping, preferring retained
-    /// left-side join fields. Workers receive complete-pair shards. Disabled
-    /// by default.
-    pub group_join_outputs: bool,
     /// Path to a Rust source file containing UDF implementations.
     pub udf_file: Option<String>,
     /// Extra search directories for `.include` directives.

@@ -11,7 +11,7 @@
 //!   collections to the emitters its outputs publish through.
 //! - `stratum`: the dataflow's strata in order, each non-recursive or
 //!   recursive.
-//! - `operator`: planned steps, shared by both kinds of stratum.
+//! - `rule`: a rule's head and body steps, shared by both kinds of stratum.
 //! - `expr`: the expressions inside operator closures.
 //! - `ty`: the `(Data, Diff, Time)` types every collection carries.
 //! - `ident`, `error`, `profiling`: binding idents, internal errors, and the
@@ -101,11 +101,8 @@ impl Codegen {
         program_planner: &ProgramPlanner,
         plan_graph: &mut Option<PlanGraph>,
     ) -> Result<Skeleton, CodegenError> {
-        self.head_output_layouts = if self.config.group_join_outputs {
-            operator::head_layout::HeadOutputLayouts::from_plan(program_planner)
-        } else {
-            Default::default()
-        };
+        self.head_output_layouts =
+            operator::head_layout::HeadOutputLayouts::from_plan(program_planner);
         self.seed_global_types();
         self.seed_global_idents();
         self.outer_fp_to_arrangement.clear();

@@ -6,7 +6,6 @@
 
 mod arrange;
 mod dedup;
-mod dedup_by_key;
 mod join;
 mod map;
 mod reduce;
@@ -15,7 +14,6 @@ pub use arrange::flowlog_arrange;
 pub use arrange::flowlog_arrange_self;
 pub use dedup::flowlog_dedup;
 pub use dedup::flowlog_input_dedup;
-pub use dedup_by_key::flowlog_dedup_by_key;
 pub use join::flowlog_antijoin;
 pub use join::flowlog_join;
 pub use map::flowlog_filter;

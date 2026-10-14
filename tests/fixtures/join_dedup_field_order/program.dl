@@ -1,0 +1,13 @@
+.decl L(k1: int32, k2: int32, k3: int32, l1: int32, l2: int32, l3: int32, witness: int32)
+.input L(IO="file", filename="L.csv", delimiter=",")
+.decl R(k1: int32, k2: int32, k3: int32, r1: int32, r2: int32, r3: int32, witness: int32)
+.input R(IO="file", filename="R.csv", delimiter=",")
+
+.decl Kept(r3: int32, l2: int32, k3: int32, r1: int32, l1: int32, k1: int32, l3: int32, r2: int32, k2: int32)
+Kept(r3,l2,k3,r1,l1,k1,l3,r2,k2) :- L(k1,k2,k3,l1,l2,l3,_), R(k1,k2,k3,r1,r2,r3,_).
+.output Kept
+
+.decl Dropped(r3: int32, l2: int32, r1: int32, l1: int32, l3: int32, r2: int32)
+Dropped(r3,l2,r1,l1,l3,r2) :- L(k1,k2,k3,l1,l2,l3,_), R(k1,k2,k3,r1,r2,r3,_).
+Dropped(60,20,40,10,30,50).
+.output Dropped

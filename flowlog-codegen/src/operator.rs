@@ -23,7 +23,6 @@ use crate::CodegenError;
 
 pub(crate) mod head_layout;
 mod join;
-mod join_layout;
 mod map;
 mod reduce;
 mod union;

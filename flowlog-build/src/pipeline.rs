@@ -97,7 +97,6 @@ fn build_config(builder: &Builder, program: &str) -> Config {
         program: program.to_string(),
         profile: builder.profile,
         str_intern: builder.string_intern,
-        group_join_outputs: builder.group_join_outputs,
         udf_file: builder
             .udf_file
             .as_ref()

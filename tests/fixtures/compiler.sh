@@ -83,7 +83,7 @@ run_compiler_task() {
     # `.printsize` reports on stdout rather than writing a file, so distill
     # those lines into one; the usual `expected/<name>` comparison pins them
     # from there.
-    # An incremental shell can prefix its first report with an epoch prompt.
+    # An incremental shell can prefix a report with an epoch prompt.
     sed -nE 's/^(\[t=[0-9]+\] >> )*(\[size\].*)$/\2/p' "$run_log" \
         > "${output_dir}/printsize"
     if (( sqlite )) && ! export_sqlite_outputs "$test_dir" "$work_dir" >>"$run_log" 2>&1; then
@@ -94,10 +94,8 @@ run_compiler_task() {
     # 4) Compare. SQLite rows and multi-worker output have no pinned order.
     local use_sort=$sqlite detail
     [[ -f "$test_dir/runtime_flags" ]] && grep -q -- '-w' "$test_dir/runtime_flags" && use_sort=1
-    # A keyed trace can reorder rows in a report without an ordering directive.
-    if [[ -f "$test_dir/compile_flags" ]] && \
-        grep -q -- '--group-join-outputs' "$test_dir/compile_flags" && \
-        ! grep -Eq '^[[:space:]]*\.output.*ord' "$test_dir/program.dl"; then
+    # Physical field order can change traversal of unordered reports.
+    if ! grep -Eq '^[[:space:]]*\.output.*ord' "$test_dir/program.dl"; then
         use_sort=1
     fi
     if detail=$(compare_expected_outputs "$test_dir" "$output_dir" "$use_sort"); then

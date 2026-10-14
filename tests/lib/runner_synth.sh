@@ -326,7 +326,6 @@ write_build_rs() {
 
     local knob_setters=""
     (( ${LIB_RUNNER_STR_INTERN:-0} )) && knob_setters+=$'        .string_intern(true)\n'
-    (( ${LIB_RUNNER_GROUP_JOIN_OUTPUTS:-0} )) && knob_setters+=$'        .group_join_outputs(true)\n'
 
     local udf_setter=""
     (( has_udf )) && udf_setter=$'        .udf_file("udf.rs")\n'

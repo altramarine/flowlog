@@ -84,10 +84,6 @@ run_lib_task() {
 
     # Per-fixture `compile_flags` become Builder knobs in the synthesized
     # build.rs.
-    LIB_RUNNER_GROUP_JOIN_OUTPUTS=0
-    if [[ -f "$test_dir/compile_flags" ]] && grep -qw -- '--group-join-outputs' "$test_dir/compile_flags"; then
-        LIB_RUNNER_GROUP_JOIN_OUTPUTS=1
-    fi
     LIB_RUNNER_STR_INTERN=0
     if [[ -f "$test_dir/compile_flags" ]] && grep -qw -- '--str-intern' "$test_dir/compile_flags"; then
         LIB_RUNNER_STR_INTERN=1

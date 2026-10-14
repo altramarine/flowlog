@@ -52,11 +52,6 @@ impl Codegen {
                 let arr = format!("{}_arr", out);
                 plan_graph.map_join_arrange_operator(name, inputs, arr, fp, output.is_k_only());
             } else {
-                let name = if self.head_output_layouts.joins.contains_key(&fp) {
-                    format!("{name} (keyed output)")
-                } else {
-                    name
-                };
                 plan_graph.map_join_operator(name, inputs, out.to_string(), fp);
             }
         });
@@ -68,12 +63,11 @@ impl Codegen {
         let out_expr = if arrange.is_some() {
             let key = self.join_projection(flow.key(), si, &left_type, &right_type)?;
             keyed_output(output, key, value)
-        } else if let Some((key, value)) =
-            self.grouped_head_join_projection(output.fingerprint(), flow.value())
+        } else if let Some(projection) = self
+            .head_output_layouts
+            .join_projection(output.fingerprint(), flow.value())
         {
-            let key = self.join_projection(&key, si, &left_type, &right_type)?;
-            let value = self.join_projection(&value, si, &left_type, &right_type)?;
-            quote! { (#key, #value) }
+            self.join_projection(&projection, si, &left_type, &right_type)?
         } else {
             value
         };

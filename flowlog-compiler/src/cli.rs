@@ -45,11 +45,6 @@ pub struct Cli {
     #[arg(long)]
     pub str_intern: bool,
 
-    /// Deduplicate rule heads as key-value pairs, preferring retained
-    /// left-side join fields as keys.
-    #[arg(long)]
-    pub group_join_outputs: bool,
-
     /// Path to a Rust source file containing UDF implementations.
     /// Functions declared with `.extern fn` in the Datalog
     /// program must be defined in this file.
@@ -86,7 +81,6 @@ impl Cli {
             program: self.program.clone(),
             profile: self.profile,
             str_intern: self.str_intern,
-            group_join_outputs: self.group_join_outputs,
             udf_file: self.udf_file.clone(),
             include_dirs: self.include_dirs.clone(),
             output_to_stdout: self.output_dir.as_deref() == Some("-"),

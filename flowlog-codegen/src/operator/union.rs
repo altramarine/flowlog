@@ -73,16 +73,16 @@ impl Codegen {
         let mut contribution = |binding: &Ident, part: Mutability| {
             let collection = lift(binding, part);
             if let Some(layout) = layout {
-                let grouped =
+                let ordered =
                     self.head_output_layouts.joins.iter().any(|(fp, found)| {
                         self.find_global_ident(*fp) == *binding && found == layout
                     });
-                if grouped {
+                if ordered {
                     collection
                 } else {
                     mapped += 1;
-                    let split = layout.split_row();
-                    quote! { #collection.map(|row: #row_ty| #split) }
+                    let reorder = layout.reorder_row();
+                    quote! { #collection.map(|row: #row_ty| #reorder) }
                 }
             } else {
                 collection
@@ -105,34 +105,22 @@ impl Codegen {
                 .iter()
                 .map(|(_, part)| u32::from(*part < mutability))
                 .sum();
-            let inputs = parts.iter().map(|(id, _)| id.to_string()).collect();
-            if layout.is_some() {
-                plan_graph.concat_keyed_dedup_operator(
-                    name.to_string(),
-                    inputs,
-                    output.to_string(),
-                    lifts + mapped + u32::from(!tail.is_empty()),
-                    mutability,
-                    recursive,
-                );
-            } else {
-                plan_graph.concat_dedup_operator(
-                    name.to_string(),
-                    inputs,
-                    output.to_string(),
-                    lifts,
-                    u32::from(!tail.is_empty()),
-                    mutability,
-                    recursive,
-                );
-            }
+            plan_graph.concat_dedup_operator(
+                name.to_string(),
+                parts.iter().map(|(id, _)| id.to_string()).collect(),
+                output.to_string(),
+                lifts + mapped + u32::from(layout.is_some()),
+                u32::from(!tail.is_empty()),
+                mutability,
+                recursive,
+            );
         });
 
         let normalized = if let Some(layout) = layout {
             let restore = layout.restore_row();
             quote! {
-                let #output = ::flowlog_runtime::operators::flowlog_dedup_by_key(#union)
-                    .map(|(k, v)| #restore);
+                let #output = ::flowlog_runtime::operators::flowlog_dedup(#union)
+                    .map(|row| #restore);
             }
         } else {
             quote! { let #output = ::flowlog_runtime::operators::flowlog_dedup(#union); }
