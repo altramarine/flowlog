@@ -1,15 +1,17 @@
 //! Incremental command dispatch.
 //!
 //! [`gen_dispatch`] adds name-based routing and prompt relation names to
-//! the generated `Inputs` container: `apply` takes one transaction
-//! update and routes it by relation and verb. A relation's arm loads the
-//! rows at the weight its mutability gives the verb; runtime loaders
-//! handle decoding and partitioning. A static relation refuses every
-//! update: its input closes after the initial load. An append relation
-//! refuses a deletion.
+//! the generated `Inputs` container. `check` says whether a relation
+//! accepts an update at all, for the prompt to refuse one before it is
+//! queued: a static relation refuses every update, since its input closes
+//! after the initial load, and an append relation refuses a deletion.
+//! `apply` takes one accepted update and routes it by relation and verb;
+//! a relation's arm loads the rows at the weight its mutability gives the
+//! verb, and runtime loaders handle decoding and partitioning. Both
+//! matches come from one classification of each relation, so they cannot
+//! disagree.
 
 use flowlog_codegen::input_field_ident;
-use flowlog_parser::InputSource;
 use flowlog_parser::Mutability;
 use flowlog_parser::Program;
 use flowlog_parser::Relation;
@@ -21,6 +23,7 @@ use crate::io::input;
 
 /// Emits name-based command dispatch on the generated `Inputs` container.
 pub(crate) fn gen_dispatch(program: &Program) -> TokenStream {
+    let mut checks = Vec::new();
     let mut arms = Vec::new();
     let mut relation_names = Vec::new();
     for relation in program.edbs() {
@@ -31,26 +34,36 @@ pub(crate) fn gen_dispatch(program: &Program) -> TokenStream {
         // Each arm binds the rows only when it loads them, so a refusing
         // arm leaves nothing unread.
         match relation.input_mutability() {
-            Mutability::Static => arms.push(quote! {
-                (#name, _) => Some(Err(::flowlog_runtime::RuntimeError::StaticRelation {
-                    relation: #raw_name
-                })),
-            }),
+            Mutability::Static => {
+                let refused = quote! {
+                    Some(Err(::flowlog_runtime::RuntimeError::StaticRelation {
+                        relation: #raw_name
+                    }))
+                };
+                checks.push(quote! { (#name, _) => #refused, });
+                arms.push(quote! { (#name, _) => #refused, });
+            }
             Mutability::Append => {
+                let refused = quote! {
+                    Some(Err(::flowlog_runtime::RuntimeError::AppendRelation {
+                        relation: #raw_name
+                    }))
+                };
                 let insert =
                     gen_load_rows(relation, &field, quote! { ::flowlog_runtime::diff::Append });
+                checks.push(quote! {
+                    (#name, ::flowlog_runtime::txn::TxnOp::Insert { .. }) => Some(Ok(())),
+                    (#name, ::flowlog_runtime::txn::TxnOp::Delete { .. }) => #refused,
+                });
                 arms.push(quote! {
                     (#name, ::flowlog_runtime::txn::TxnOp::Insert { rows, .. }) => #insert,
-                    (#name, ::flowlog_runtime::txn::TxnOp::Delete { .. }) => {
-                        Some(Err(::flowlog_runtime::RuntimeError::AppendRelation {
-                            relation: #raw_name
-                        }))
-                    }
+                    (#name, ::flowlog_runtime::txn::TxnOp::Delete { .. }) => #refused,
                 });
             }
             Mutability::Mutable => {
                 let insert = gen_load_rows(relation, &field, quote! { 1 });
                 let delete = gen_load_rows(relation, &field, quote! { -1 });
+                checks.push(quote! { (#name, _) => Some(Ok(())), });
                 arms.push(quote! {
                     (#name, ::flowlog_runtime::txn::TxnOp::Insert { rows, .. }) => #insert,
                     (#name, ::flowlog_runtime::txn::TxnOp::Delete { rows, .. }) => #delete,
@@ -62,6 +75,15 @@ pub(crate) fn gen_dispatch(program: &Program) -> TokenStream {
     quote! {
         impl Inputs {
             pub fn names() -> &'static [&'static str] { &[#(#relation_names),*] }
+
+            pub fn check(
+                op: &::flowlog_runtime::txn::TxnOp,
+            ) -> Option<Result<(), ::flowlog_runtime::RuntimeError>> {
+                match (op.rel().to_ascii_lowercase().as_str(), op) {
+                    #(#checks)*
+                    _ => None,
+                }
+            }
 
             pub fn apply(
                 &mut self,
@@ -79,8 +101,7 @@ pub(crate) fn gen_dispatch(program: &Program) -> TokenStream {
 
 /// Returns the load of `rows` into `relation` through its loader `field`
 /// at weight `diff`: a tuple through the put loader, a file through the
-/// source's file loader. A SQLite source that fails ends the process: its
-/// rows cannot be partially applied.
+/// source's file loader.
 fn gen_load_rows(relation: &Relation, field: &Ident, diff: TokenStream) -> TokenStream {
     let file = input::gen_load(
         relation,
@@ -88,20 +109,6 @@ fn gen_load_rows(relation: &Relation, field: &Ident, diff: TokenStream) -> Token
         quote! { path },
         diff.clone(),
     );
-    let file = match relation.input() {
-        Some(InputSource::Sqlite { .. }) => {
-            let relation_name = relation.raw_name();
-            quote! {{
-                let result = #file;
-                if let Err(error) = &result {
-                    eprintln!("[relation][{}] {} in {}", #relation_name, error, path.display());
-                    std::process::exit(1);
-                }
-                result
-            }}
-        }
-        Some(InputSource::File { .. } | InputSource::Command { .. }) | None => file,
-    };
     quote! {
         Some(match rows {
             ::flowlog_runtime::txn::Rows::Tuple(text) => self.#field.load_put(text, ordinal, #diff),
@@ -159,6 +166,41 @@ mod tests {
         }
     }
 
+    /// The prompt's check and the workers' apply classify an update alike:
+    /// a static relation refuses every update, an append relation a
+    /// deletion, a mutable relation nothing.
+    #[test]
+    fn check_refuses_what_its_relation_does_not_accept() {
+        let generated = generate(
+            r#"
+            .decl Fixed(id: int32)
+            .input Fixed(delimiter=",")
+            .decl Grow(id: int32) append
+            .input Grow(IO="command")
+            .decl Edge(id: int32) mutable
+            .input Edge(IO="command")
+            .decl Out(id: int32)
+            Out(x) :- Fixed(x), Grow(x), Edge(x).
+            .output Out
+            "#,
+        );
+        for expected in [
+            quote! {
+                ("fixed", _) => Some(Err(::flowlog_runtime::RuntimeError::StaticRelation {
+                    relation: "Fixed"
+                })),
+            },
+            quote! {
+                ("grow", ::flowlog_runtime::txn::TxnOp::Insert { .. }) => Some(Ok(())),
+                ("grow", ::flowlog_runtime::txn::TxnOp::Delete { .. }) =>
+                    Some(Err(::flowlog_runtime::RuntimeError::AppendRelation { relation: "Grow" })),
+            },
+            quote! { ("edge", _) => Some(Ok(())), },
+        ] {
+            assert!(generated.contains(&expected.to_string()), "{generated}");
+        }
+    }
+
     /// An insert into an append relation loads its rows with presence, a
     /// tuple and a file alike; a deletion is refused without reading them.
     #[test]
@@ -182,9 +224,8 @@ mod tests {
                 }),
             },
             quote! {
-                ("edge", ::flowlog_runtime::txn::TxnOp::Delete { .. }) => {
-                    Some(Err(::flowlog_runtime::RuntimeError::AppendRelation { relation: "Edge" }))
-                }
+                ("edge", ::flowlog_runtime::txn::TxnOp::Delete { .. }) =>
+                    Some(Err(::flowlog_runtime::RuntimeError::AppendRelation { relation: "Edge" })),
             },
         ] {
             assert!(generated.contains(&expected.to_string()), "{generated}");

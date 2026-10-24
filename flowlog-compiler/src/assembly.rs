@@ -52,3 +52,26 @@ impl Compiler {
         }
     }
 }
+
+/// Reports what the workers stopped on, each distinct message once, and
+/// exits with status 1 on any, before output is written.
+fn exit_on_worker_error() -> TokenStream {
+    quote! {
+        for result in guards.join() {
+            match result {
+                Ok(Ok(())) => {}
+                // The worker recorded its error before returning it, so
+                // the others could stop too; the set keeps one copy.
+                Ok(Err(error)) => failure.record(error.to_string()),
+                Err(_) => failure.record("a worker thread panicked".to_string()),
+            }
+        }
+        let messages = failure.messages();
+        if !messages.is_empty() {
+            for message in &messages {
+                eprintln!("{message}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
