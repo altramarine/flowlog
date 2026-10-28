@@ -1,222 +1,54 @@
-# Problem: Assigning Physical Attribute Orders Across a Dataflow
+# Physical Attribute Layout Assignment
 
-## Problem statement
+## Problem
 
-Attribute order is a physical design decision. It affects how updates are
-generated, sorted, consolidated, exchanged between workers, merged into
-arrangements, and traversed by later operators. Aligning one operator's
-layout with its upstream or downstream can substantially reduce work, but
-the best order for one edge can be expensive for another.
+Choose physical attribute orders across a planned dataflow so that producers
+and consumers require less reordering. The choices include input storage,
+arrangement keys and values, join orientation, rule heads, and recursive
+feedback. Logical argument order stays unchanged; fixed external formats
+are handled by input/output mappings.
 
-The rule-head experiment in [PR #418][field-order-pr] chooses a physical
-row order from an upstream join, normalizes rows in that order, and restores
-the logical head order. The broader problem is to consider
-attribute order for **every arrangement and the complete path through the
-dataflow**, including inputs, intermediate results, rule heads, recursive
-feedback, and outputs.
+The design optimizes layouts for an existing join tree and sharing
+structure. It minimizes an additive layout cost, with every sorting
+boundary weighted equally. An optimal assignment means optimal under
+this cost model; actual runtime also depends on cardinality, skew,
+timestamps, and worker partitioning.
 
-> Given a planned Datalog dataflow and an expected workload, assign
-> physical attribute orders to its records, arrangement keys and values,
-> and join outputs to minimize end-to-end execution time, while preserving
-> semantics and respecting a memory budget.
+## Motivating examples
 
-The argument order written by the user defines logical attribute bindings;
-it does not have to define physical storage order. Input ingestion and
-output serialization may also use chosen layouts when their interfaces
-allow it. A rule head may retain an optimized physical order through
-recursion and downstream consumers instead of immediately restoring the
-user-written order. Explicit conversions are needed where a fixed external
-format is required.
+### Join output versus downstream arrangements
 
-## What can be assigned?
-
-The logical plan determines which attributes a lookup or join needs. The
-physical planner can choose their order:
-
-| Object | Layout decisions |
-|---|---|
-| Input relation | Stored attribute order after input decoding |
-| Arrangement | Order within its key tuple and within its value tuple |
-| Join inputs | A common ordered join key, plus each side's value order |
-| Join output | Projection and physical order of the retained attributes |
-| Rule head | Physical row order used by its union, dedup, and feedback |
-| Output relation | Stored and emitted order, subject to interface requirements |
-
-For an arrangement with required key attributes `K` and value attributes
-`V`, its layout is an ordered pair of permutations:
-
-```text
-Arrangement layout = (order(K), order(V))
-```
-
-Reordering a key tuple does not change the equality predicate, provided
-both sides of a join use the same logical attributes in the same physical
-key order. Key membership and key order are separate decisions: an
-attribute required for a lookup cannot simply be moved into the value.
-
-For example:
-
-```prolog
-J(a,b,c,d,e,f) :- L(a,b,c,d), R(a,b,e,f).
-```
-
-One compatible assignment is:
-
-```text
-left arrangement:  K=(b,a), V=(d,c)
-right arrangement: K=(b,a), V=(f,e)
-join traversal model: (b,a,d,c,f,e)
-```
-
-This can favor a consumer needing `K=(b,a,d,c), V=(f,e)`, while a consumer
-needing `K=(a,b,e,f), V=(c,d)` favors a different layout. The choice of
-`(a,b)` versus `(b,a)` and the orders inside each value tuple must therefore
-consider both the source arrangements and the consumers.
-
-### The join-order model needs a scope
-
-`(join key, left value, right value)` is a useful model of local join
-enumeration, especially for a straightforward value cross product. The
-orders inside all three tuples are meaningful choices. Changing an input
-arrangement's value order changes match traversal; changing the output
-tuple's field positions alone changes the layout in which those matches
-are buffered and sorted. These are related but distinct decisions.
-
-Actual incremental joins process multiple batches and timestamped
-histories. Larger histories may replay updates from either side according
-to time, rather than always using a fixed left-outer/right-inner loop.
-Projection can also discard the leading join key or value fields, breaking
-the ordering inherited from traversal. Output buffers still sort and
-consolidate their chunks. Layout alignment should therefore be modeled as
-a potential cost reduction, with explicit order properties where they
-are guaranteed.
-
-Arrangement maintenance sorts and consolidates updates and merges sorted
-batches into a trace. An arranged join traverses two such traces with
-merge-style cursors. Relevant costs include output-buffer sorting, batch
-merging, history access, and worker exchange, not just tuple construction.
-
-## Examples motivating the problem
-
-### 1. DOOP/Jython: the head layout can match the producing join
-
-Consider the points-to propagation rule:
+The DOOP/Jython propagation rule is:
 
 ```prolog
 VarPointsTo(heap,to) :- Assign(from,to), VarPointsTo(heap,from).
 ```
 
-With `Assign` on the left, the join inputs have:
+With `Assign` on the left, the nominal join order is:
 
 ```text
-left:  K=(from), V=(to)
-right: K=(from), V=(heap)
+K=(from), LV=(to), RV=(heap)
+source: (from,to,heap)
+projected head: (heap,to)
 ```
 
-After dropping `from`, `(to,heap)` follows the left-value/right-value
-model, while the user-written head is `(heap,to)`.
+A head layout `(to,heap)` better follows that traversal, but some consumers
+need heap-first arrangements. Swapping the join inputs changes the
+nominal source to `(from,heap,to)`. The optimizer must consider both
+upstreams, the head, and its consumers together.
 
-```text
-experimental physical path:
-join -> (to,heap) -> ordinary dedup -> restore (heap,to)
+The rule-head field-order experiment in [PR #418][field-order-pr] reduced
+whole-program Jython time from about 315s to 214s. Other workloads exposed
+conflicts: Scallop's large seed favored a different layout from its joins,
+and Z3's locally attractive head layout made recursive block-key indexes
+more expensive. These motivate a global assignment rather than choosing
+one upstream's preferred order.
 
-broader layout opportunity:
-join -> (to,heap) -> ordinary dedup -> retain that layout for consumers
-```
+`K ++ LV ++ RV` models local join traversal. Incremental history replay
+and output chunking do not guarantee that the complete stream has this
+order. The cost model uses it as a reference order.
 
-In the full-suite comparison described below, DOOP/Jython execution time
-decreased from approximately **315 seconds to 214 seconds** with the field-order
-implementation. This is a whole-program result involving multiple heads;
-it is not an isolated timing of this rule or of sorting alone.
-
-The local benefit has a downstream cost. Some consumers need an arrangement
-whose complete key is `(heap,var)`. Restoring logical field positions with
-a map does not restore the previous sorted order or worker partition.
-Earlier DOOP profiles showed that a cheaper VarPointsTo head could coexist
-with a more expensive downstream full-key arrangement.
-
-The assignment should account for both kinds of consumers. It may be useful
-to keep a variable-first primary layout, use a heap-first view where needed,
-or choose another shared layout. Each conversion or additional view has a
-cost. Changing the input orientation can also change which retained value
-comes first, so a layout preference is conditional on the chosen join plan.
-
-### 2. Scallop: the largest contributor may be a seed, not a join
-
-The Polonius query used by Scallop contains:
-
-```prolog
-subset(o1,o2,p) :- subset_base(o1,o2,p).
-
-subset(o1,o3,p) :-
-    subset(o1,o2,p),
-    subset_base(o2,o3,p),
-    o1 != o3.
-
-subset(o1,o2,p2) :-
-    subset(o1,o2,p1),
-    cfg_edge(p1,p2),
-    origin_live_on_entry(o1,p2),
-    origin_live_on_entry(o2,p2).
-```
-
-The transitive rule joins on `(o2,p)` and retains `p`, the left value `o1`,
-and the right value `o3`. It suggests a point-first head layout. The last
-semijoin in the CFG propagation rule instead suggests `(o2,p2,o1)`.
-
-But this workload has about **27.4 million seed records**, accounting for
-roughly **97% of the input updates to the recursive subset head**. Choosing
-a layout from a smaller join also forces the large seed through that
-layout. The subsequent consumers need several different keys:
-
-```text
-(o2,p), (p), (o1), (o1,p)
-```
-
-The previous exploration found that `(o2,p,o1)` improved the `(o2,p)`
-arrangement relative to the point-first layout, but made the point-only
-arrangement more expensive. It also retained costs at the seed and
-recursive head. Restoring the original layout for the entire subset path
-performed better in that comparison than restoring only the seed layout.
-
-This example requires weighting all producers and consumers by their work:
-seed volume, join updates, recursive iterations, and downstream index
-construction. Picking the first eligible join cannot express that trade-off.
-
-### 3. Z3: a locally attractive order can hurt recursive trace access
-
-Abbreviate `Stack_def_use_live_var_at_block_end` as `StackEnd`:
-
-```prolog
-StackEnd(prev,used,reg,pos) :-
-    StackEnd(block,used,reg,pos),
-    !Stack_def_use_ref_in_block(block,reg,pos),
-    !Reg_def_use_defined_in_block(block,reg),
-    Block_next(prev,_,block).
-```
-
-The final join has:
-
-```text
-K=(block), LV=(reg,pos,used), RV=(prev)
-```
-
-The experimental field-order policy selects `(reg,pos,used,prev)` instead
-of the original `(prev,used,reg,pos)`. However, the join key `block` is projected
-away: value order within one block does not imply sorted projected output
-across different blocks. Incremental history replay adds another source
-of variation in emission order.
-
-The head's `prev` becomes the next iteration's `block`. Recursive and later
-consumers need block-leading keys such as `(block,reg,pos)`. Previous profiles
-showed higher costs in the head arrangement, membership threshold, and
-downstream Block indexes after the variable-first layout was introduced.
-
-The assignment must include the cost of the persistent head trace and its
-feedback consumers. Improving a local traversal pattern is insufficient
-if the chosen layout makes these larger or repeated operations more costly.
-
-### 4. Multiple upstreams: a shared head needs a shared decision
+### Multiple producers must agree
 
 ```prolog
 Out(c,a) :- R(a,b), S(b,c).
@@ -224,741 +56,279 @@ Out(c,a) :- T(c,d), U(d,a).
 Out(c,a) :- Seed(c,a).
 ```
 
-Under the corresponding left/right input orientations, the first join
-favors `(a,c)` and the second favors `(c,a)`. The seed has its own input
-layout. If these contributions share one head trace, they must agree on
-one physical schema before normalization.
+The first join favors `(a,c)` and the second favors `(c,a)`. Both and the
+seed feed one head layout. Each producer contributes an alignment cost;
+they cannot independently choose incompatible layouts for that head.
 
-Selecting the first join's preferred order can benefit that branch while
-reordering the other join and the seed. A downstream consumer can introduce
-a third preference. Choosing a shared layout should consider the volume and
-order properties of every contributor, rather than treating one upstream
-as the representative of the entire relation.
+## Transition cost: C[sigma_1 -> sigma_2]
 
-Likewise, a shared intermediate arrangement may serve several joins with
-different preferences. The assignment must decide when a single layout is
-adequate and when another materialized view is worth its memory and update
-cost.
+A layout is a comparison order of attribute origins. Origins track fields
+through renaming and projection, so unrelated fields with the same name
+remain distinct.
 
-## Objective and constraints
-
-The objective is **end-to-end execution time**, subject to an acceptable
-peak-memory budget. Local sorting time or summed worker CPU is evidence
-for a cost model, but does not directly equal parallel wall-clock time.
-
-A useful cost model should account for:
-
-- Input volume, duplicate witnesses, and the order of incoming update runs.
-- Join output-buffer sorting and consolidation under each proposed layout.
-- Arrangement batch construction, merging, and historical trace access.
-- Conversions and exchanges between incompatible producer/consumer layouts.
-- Repeated work along recursive feedback, including delta and seed volumes.
-- Worker load balance, shared arrangements, and additional materialized views.
-
-The assignment must preserve these constraints:
-
-1. Logical attribute bindings, types, projections, predicates, and outputs
-   remain semantically equivalent under the physical representation.
-2. Both join inputs use compatible key identities and key order.
-3. Contributors to a shared union or trace agree on a physical schema, or
-   have explicit, correctly costed conversions.
-4. Dedup membership still uses the intended projected record. A discarded
-   witness or join key cannot be added to its identity merely to preserve
-   ordering. Signed multiplicities, aggregates, and timestamps retain their
-   meaning.
-5. A persistent trace has a consistent interpretation across its lifetime;
-   recursive feedback and any alternate views respect that interpretation.
-6. Input/output mappings honor any required external schema. Where the
-   interface is flexible, its physical order participates in the assignment.
-
-Sorting compatibility and partitioning compatibility must be tracked
-separately. Ordinary head dedup hashes a complete physical row; an ordinary
-keyed arrangement exchanges by its key. Matching their attribute order
-does not automatically put records on the same worker. Permuting a tuple
-can itself change its hash and worker placement.
-
-## What a good assignment should achieve
-
-The goal is to choose mutually compatible layouts over the operator graph,
-with conversions and additional indexes introduced where their total cost
-is justified. It should favor expensive or frequently executed paths,
-account for conflicting producers and consumers, and keep beneficial
-layouts through rule heads and recursion when possible. The user-written
-column order and `(key,left-value,right-value)` traversal model provide
-reference layouts, not a universal optimum.
-
-## Dynamic programming design
-
-The design below chooses layouts and physical left/right join orientation
-for an existing plan. The join tree, materializations, projections, and
-sharing decisions are inputs to this optimization. Changing join
-associativity or choosing new sharing parents is a separate search problem.
-
-The optimizer minimizes an additive layout cost. An exact solution means
-the minimum of that objective over all legal assignments in the modeled
-graph. It does not mean the minimum execution time on an unknown dataset.
-In particular, the nominal join traversal order described above is a
-modeling assumption, not a global ordering guarantee of Differential
-Dataflow's incremental join stream.
-The solver's table-memory budget below is also separate from the runtime
-memory budget in the broader problem statement.
-
-### 1. The cost abstraction: C[sigma_1 -> sigma_2]
-
-A layout is a lexicographic order of **attribute origins**. Origins identify
-fields through renaming and projection; two unrelated fields with the same
-name are not the same origin. At a sorting boundary, define
+Define $C[\sigma_1\to\sigma_2]$ as the estimated reordering work from a
+producer's order to a consumer's comparator. It is zero for an unchanged
+comparator and excludes fixed scanning and hashing work. The objective is
 
 $$
-C[\sigma_1 \to \sigma_2]
+\min_\ell\sum_{e\in E_{\mathrm{sort}}}
+C[\sigma_e(\ell)\to\tau_e(\ell)],
 $$
 
-as the estimated additional reordering work when records generated in
-source order $\sigma_1$ are consumed in target order $\sigma_2$. The target
-is expressed in source origins through the intervening field mappings.
-It may retain only a subset of the source fields.
+where $\ell$ assigns all layouts and join orientations. Charge each actual
+sorting boundary once. Pure maps compose until the next such boundary.
 
-The abstraction separates the solver from the cost model:
+### Raw binary-record inversions
 
-- A legal transition has a nonnegative cost. An illegal assignment has
-  cost $+\infty$, or is excluded from the state domain.
-- An unchanged comparator has zero additional reordering cost. This
-  excludes the fixed cost of scanning, hashing, and maintaining an index.
-- Each modeled sorting boundary contributes once. There is no separate
-  cost for a pure rename or projection with no sorting boundary.
-- Projection costs need not be symmetric. They describe the source
-  sequence before records with equal projected values are consolidated.
+Our initial $C$ is the raw inversion count $I$: assume every source field
+is binary and all $2^m$ records appear once. Sort them by $\sigma_1$ and
+count record pairs reversed by $\sigma_2$. Equal projected records do not
+count as inversions. This counts record inversions, not attribute swaps:
 
-The initial objective uses unit weights and no additional node cost:
-
-$$
-F(\ell)=\sum_{e\in E_{\mathrm{sort}}}
-C[\sigma_e(\ell)\to\tau_e(\ell)].
-$$
-
-Here $\ell$ is one assignment of all layout and join-orientation variables.
-The sum is over physical sorting boundaries, not arbitrary graph edges.
-Every consumer has its own contribution; a producer's cost is not divided
-by its number of consumers. Additional workload weights could be introduced
-later without changing the DP, but are not required by this design.
-
-#### A concrete instance: raw binary-record inversions
-
-One data-independent instance of $C$ is the raw inversion count $I$.
-For $m$ distinct source origins, assume all $2^m$ binary records occur
-once. Sort them lexicographically by $\sigma_1$, apply the field mapping,
-and count pairs whose order is reversed by the target comparator.
-Equal projected records do not form a strict inversion. Timestamps and
-update weights are outside this synthetic record model; the optimization
-does not remove them from runtime records.
-
-This counts **record inversions**, not inversions of the attribute
-permutation. It distinguishes changing an early comparison field from
-changing a late one:
-
-| Source | Target | Raw I |
+| Source | Target | I |
 |---|---|---:|
 | `(a,b,c)` | `(b,a,c)` | 4 |
 | `(a,b,c)` | `(a,c,b)` | 2 |
 | `(c,a,b)` | `(a,b)` | 6 |
 | `(c,b,a)` | `(a,b)` | 8 |
 
-For full permutations of the same fields, let $P_\sigma(x)$ be the set
-of fields preceding $x$ in $\sigma$. Then
+The score can be computed from field orders without generating the binary
+records. It is a data-independent sorting surrogate, not a prediction of
+sorter comparisons or execution seconds.
 
-$$
-I(\sigma,\tau)=
-\sum_{\substack{x<_\sigma y\\y<_\tau x}}
-2^{\,2m-|P_\sigma(x)\cup P_\tau(y)|-4}.
-$$
+### Projection
 
-Each term counts record pairs whose first unequal source field is $x$
-and first unequal target field is $y$. These classes are disjoint. Thus
-the score can be computed without enumerating the binary records.
-A direct implementation of this formula visits $O(m^2)$ field pairs.
-The DP below treats the evaluation cost as a parameter rather than
-assuming a particular implementation of $I$.
-
-Raw $I$ is a sorting surrogate. It is not the comparison count of the
-runtime sorter, the cost of trace merging, or a prediction of parallel
-wall-clock time. The binary model is rebuilt at each modeled boundary;
-it does not propagate real cardinalities or correlations through joins.
-
-#### Projection keeps a virtual suffix
-
-Let $\tau$ list the retained fields, and let $D$ list dropped fields in
-their source-relative order. For the raw-I instance, define
-
-$$
-C[\sigma\to\tau]=I(\sigma,\tau\mathbin\Vert D).
-$$
-
-The suffix is only a device for scoring. It does not become part of the
-physical row, arrangement value, or dedup identity. If two records differ
-on retained fields, their order is decided before the suffix. If they
-agree on retained fields, the suffix preserves their source order and
-introduces no extra inversion.
-
-For example:
+Keep dropped fields as a **virtual suffix in source order** when scoring:
 
 ```text
-feed:                 (a,b,c,d,e)
-retained comparator:  (c,d,e)
-comparison for C:     (a,b,c,d,e) -> (c,d,e,a,b)
+source:             (a,b,c,d,e)
+retained comparator: (c,d,e)
+score:              (a,b,c,d,e) -> (c,d,e,a,b)
 ```
 
-Consecutive pure projections compose before scoring:
+This preserves the order and multiplicity of projected witnesses. The
+suffix is used only for scoring; it never becomes part of the physical
+row or dedup identity. Consecutive pure projections compose, for example
+`(a,b,c) -> (b,c) -> (c)` is scored once as `(a,b,c) -> (c,a,b)`.
+A real intervening materialization starts a new boundary using its actual
+surviving fields.
 
-```text
-(a,b,c) -> (b,c) -> (c) -> arrangement
-one cost: (a,b,c) -> (c,a,b)
-```
-
-A real intervening arrangement or dedup is a new boundary and prevents
-this composition. Its downstream model starts from the fields that
-actually survive that boundary; discarded fields do not reappear.
-
-For the earlier two-input example:
+For an arrangement consuming a join:
 
 ```text
 R: K=(k), V=(a,b)
 S: K=(k), V=(c,d)
-nominal join source: (k,a,b,c,d)
-downstream arrangement: K=(b,d), V=(a,c)
-comparison for C: (k,a,b,c,d) -> (b,d,a,c,k)
+join source: (k,a,b,c,d)
+consumer: K=(b,d), V=(a,c)
+score: (k,a,b,c,d) -> (b,d,a,c,k)
 ```
 
-Here the conceptual trailing block `V'=(k)` is a virtual suffix. The
-legal target keeps all of `K` before all of `V`, with permutations allowed
-inside each block. No runtime index retains `k` merely for this score.
+The conceptual `V'=(k)` is the dropped suffix. Required key fields stay
+before value fields; orders within `K` and `V` remain choices.
 
-### 2. A graph of variables and factors
+## Graph model
 
-Represent the assignment problem as a finite **factor graph**. It is a
-bipartite, undirected graph: variable nodes hold layout choices, and factor
-nodes assign costs or enforce compatibility between those choices.
-Dataflow direction remains metadata used to interpret each factor.
+Use a bipartite, undirected **factor graph**:
 
-For each physical representation, introduce permutation variables for its
-key and value blocks. A block of $b$ unconstrained fields has $b!$ states.
-An arrangement with key width $k$ and value width $v$ therefore has
-$k!v!$ legal layouts, rather than $(k+v)!$. A full-row representation
-has $m!$ states unless further constraints apply.
+- A variable chooses a physical layout block or join orientation.
+- A factor charges a transition cost or enforces compatibility among
+  the variables that determine that transition.
 
-The variables can remain split into blocks, which often produces smaller
-factor scopes. The domain size of variable $x$ is denoted $d_x$.
-Singleton domains can be substituted immediately.
+A block of $b$ fields has $b!$ permutations. An arrangement has
+$k!v!$ legal layouts: permute its key and value separately, with the key
+first. A free full-row layout has $m!$ states. Write $d_x$ for variable
+$x$'s domain size.
 
-The graph must express the following identities and choices:
+The model preserves these constraints:
 
-- The two inputs of a join share the same key-permutation variable after
-  their equal attributes are mapped to common origins.
-- A legal inner join has an orientation variable with at most two states.
-  Its nominal source is `K ++ LV ++ RV` or `K ++ RV ++ LV`. Asymmetric
-  operators, such as antijoins, keep their required semantic orientation.
-- All producers of one union/head agree on its physical layout. Each
-  producer has a factor mapping its own origins to that shared layout.
-- Recursive feedback reuses the same representation variables. Iterations
-  are not unrolled into new optimization variables.
-- Two different arrangements of a relation have distinct layout variables,
-  even if their field sets happen to agree. Only an actually shared trace
-  shares a physical-layout decision.
-- External schemas, key membership, and unsupported transformations impose
-  domain restrictions or compatibility factors.
+1. Both join inputs use the same ordered key; share its permutation
+   variable. A swappable join has two orientations, while asymmetric
+   operators keep their required direction.
+2. Producers of one head or union share its layout. Recursive feedback
+   reuses the same representation variables, without unrolling iterations.
+3. Different arrangements of a relation have separate variables. Only
+   actual shared representations share a layout choice.
+4. Projections, logical bindings, set membership, signed updates, and
+   required external schemas keep their semantics. Unsupported choices
+   are excluded from the domains or assigned infinite cost.
 
-A sorting factor $f_e$ depends on every variable needed to determine
-$\sigma_e$ and $\tau_e$. Its value is their transition cost. A join can
-therefore induce a factor involving both input value permutations, the
-shared key permutation, orientation, and the target layout. It cannot in
-general be replaced by two independently minimized input costs.
-
-For a simplified join with layout variables $a,b,c$:
+For a join, a factor can depend on the common key order, both value
+orders, orientation, and target layout. A simplified view is:
 
 ```text
-dataflow:       A join B -> C
-
-factor graph:  [a] ---- (join factor) ---- [c]
-                             |
-                            [b]
+[A layout] --- (join cost) --- [C layout]
+                    |
+                [B layout]
 ```
 
-Square brackets denote variables and parentheses denote factors. A factor
-can have more than two neighbors; such a star is still a tree.
+The factor graph must be acyclic for tree DP. A dataflow DAG alone is
+insufficient: `Q -> A -> H` and `Q -> B -> H` couple the shared layouts
+of both `Q` and `H`, forming an undirected cycle. Likewise, an arrangement
+sharing tree does not automatically make the layout factor graph a tree.
 
-A shared producer may create a cycle even when the dataflow is a DAG:
+## DP on a forest
 
-```text
-dataflow:       Q -> A -> H
-                \-> B -> H
-
-factor graph:  [q] -- (fQA) -- [a] -- (fAH) -- [h]
-                |                              |
-               (fQB) -------- [b] ----------- (fBH)
-```
-
-The layout of `q` and the layout of `h` must each be chosen consistently
-for both branches. Solving the branches independently loses that coupling.
-Consequently, breaking directed recursion alone is insufficient: the DP
-needs an **undirected factor-graph forest** after conditioning.
-
-Sharing topology is fixed here. A tree of arrangement-sharing parents is
-not automatically a forest in this graph, and the DP does not select
-sharing parents unless those choices are explicitly added to the model.
-
-### 3. Exact DP on a forest
-
-For a variable $x$ and adjacent factor $f$, let $M_{x\to f}(s)$ be the
-minimum cost on the $x$ side of that edge when $x=s$. Let $N(x)$ and
-$N(f)$ denote neighbors. With unary restrictions $u_x$, zero for a legal
-state unless a separate unary cost is explicitly modeled:
+Root each factor-tree component anywhere. A message is a table of minimum
+costs indexed by the state of the variable connecting a subtree to its
+parent. Let $N$ denote neighbors. A variable sums its child messages:
 
 $$
-M_{x\to f}(s)=u_x(s)+
-\sum_{g\in N(x)\setminus\{f\}}M_{g\to x}(s).
+M_{x\to f}(s)=\sum_{g\in N(x)\setminus\{f\}}M_{g\to x}(s).
 $$
 
-A factor sends a message by minimizing over all its other variables:
+A factor minimizes over its other variables:
 
 $$
 M_{f\to x}(s)=
 \min_{\{s_y:y\in N(f)\setminus\{x\}\}}
-\left[
-f(s,\{s_y\})+
-\sum_{y\in N(f)\setminus\{x\}}M_{y\to f}(s_y)
-\right].
+\left[f(s,\{s_y\})+
+\sum_{y\in N(f)\setminus\{x\}}M_{y\to f}(s_y)\right].
 $$
 
-Choose any variable as a root in each component. Evaluate messages from
-leaves toward that root. The component optimum is
+At the root, sum incoming messages and choose the cheapest state. Store
+minimizing choices to recover the full assignment. Sum the optima of
+independent components. This is exact because subtrees are independent
+once their connecting variable is fixed, and every factor is charged once.
 
-$$
-\min_s\left[u_r(s)+\sum_{f\in N(r)}M_{f\to r}(s)\right].
-$$
+### A join can be solved in either direction
 
-Store minimizing choices and backtrack from the winning root state to
-recover one consistent layout and orientation assignment. Independent
-components contribute a sum of optima. A second message pass is useful
-when all conditional optima are wanted, but is unnecessary to recover
-one optimal assignment.
-
-#### Transitions can run against dataflow
-
-For `A join B -> C`, root the factor tree at `A` if convenient. The message
-to `A` is
+For `A join B -> C`, writing input/output layout states as $a,b,c$ and
+orientation as $o$, a message toward `A` is
 
 $$
 M_{J\to A}(a)=\min_{b,c,o}
 \left[J(a,b,c,o)+M_{B\to J}(b)+M_{C\to J}(c)+M_{o\to J}(o)\right].
 $$
 
-The message from `C` includes its downstream costs. This transition
-jointly chooses `B`, `C`, and orientation; it does not freeze `C` at the
-locally cheapest layout. The same factor sends a message to `C` by
-minimizing over `A`, `B`, and orientation. Reversing the message direction
-does not reverse the physical operator or replace $C[\sigma\to\tau]$
-by $C[\tau\to\sigma]$.
+`J` enforces compatible input keys. The message from `C` includes its
+downstream costs. Thus the transition jointly chooses `B`, `C`, and
+orientation rather than freezing a locally preferred output. A message
+toward `C` instead minimizes over `A`, `B`, and orientation. Reversing the
+DP direction does not reverse the physical transition cost.
 
-For an unshared join tree, the familiar forward recurrence is a special
-case. Write $q,p,t$ for key, left-value, and right-value permutations:
+### Reduce transition work
 
-$$
-F_C(\tau)=\min_{q,p,t,o}
-\left[F_A(q,p)+F_B(q,t)+
-C[q\Vert V_o(p,t)\to\tau]\right],
-$$
-
-where $V_0(p,t)=p\Vert t$ and $V_1(p,t)=t\Vert p$.
-Both inputs use the same $q$. For projected output, the cost applies the
-virtual-suffix rule above.
-
-A union whose producer subtrees are independent has the recurrence
-
-$$
-F_H(\tau)=\sum_i\min_{\sigma_i}
-\left[F_i(\sigma_i)+C[\sigma_i\to\tau]\right].
-$$
-
-Every term uses the same $\tau$. This is a sum of alignment contributions
-to one head, not a proposal to insert a separate runtime dedup per producer.
-If producer subtrees share variables, use the complete factor graph rather
-than adding overlapping subtree costs.
-
-The forest recurrence is exact because removing an edge separates the
-remaining variables into independent subproblems conditional on its
-boundary variable. Each factor is charged once, and every legal state on
-that boundary is considered. This conditional independence is the reason
-the algorithm works; dataflow acyclicity by itself does not supply it.
-
-### 4. Exact reductions and transition optimizations
-
-These transformations reduce optimization work. They do not require
-changing the runtime operator structure.
-
-#### Compose maps, share identities, and remove fixed states
-
-Compose consecutive pure field mappings before extracting sorting factors.
-Represent a shared join-key order by one variable rather than an equality
-table over two copies. Substitute singleton or externally pinned states,
-drop genuinely unused variables, and solve disconnected components
-separately. Keep each nonconstant factor and its cost exactly once.
-
-#### Eliminate unrestricted intermediate full-row layouts
-
-For raw $I$ on the same complete field set, the record-order inversion
-distance obeys the triangle inequality. If an intermediate $\zeta$ has
-only two incident costs, may choose every permutation, and has no other
-constraint or consumer, then
-
-$$
-\min_\zeta\left[I(\sigma,\zeta)+I(\zeta,\tau)\right]
-=I(\sigma,\tau).
-$$
-
-Choosing $\zeta=\tau$ attains the bound. This removes a search variable;
-its layout can be recovered afterward. The identity requires the same
-field set and compatible cost scales. It does not justify eliminating an
-arbitrary projected, pinned, or shared intermediate representation.
-
-#### Separate source blocks when the cost permits it
-
-Raw binary-record $I$ has an additional property. For a fixed target and
-fixed block order, the effects of internal permutations of disjoint
-source blocks are additive. For a join, this gives
+- Compose pure maps, substitute fixed states, and share common key
+  variables before solving.
+- Cache local factor tables across cut assignments. Reuse messages when
+  their relevant cut states have not changed.
+- For raw $I$, remove an unrestricted full-row intermediate layout with
+  only two incident transitions on the same field set:
+  $\min_\zeta[I(\sigma,\zeta)+I(\zeta,\tau)]=I(\sigma,\tau)$.
+  The triangle inequality gives the bound, attained by $\zeta=\tau$.
+- Use raw $I$'s source-block decomposition. For a fixed target and block
+  order, effects of internal source-block permutations are additive:
 
 $$
 I(q\Vert p\Vert t,\tau)=
 c(\tau)+g_K(q,\tau)+g_L(p,\tau)+g_R(t,\tau).
 $$
 
-To see why, partition record pairs by the first **source block** on which
-they differ. Their source comparison depends only on the permutation in
-that block. Fixing the target comparator leaves the permutations of other
-blocks irrelevant to that class. The argument also holds for strict
-comparison after projection.
+Here $q,p,t$ are key, left-value, and right-value orders. Partitioning
+record pairs by their first unequal source block explains the identity:
+only that block's internal order determines their source comparison.
+It also holds after projection. For fixed key order, orientation, and
+target, independent left and right child choices can therefore be
+minimized separately. Compute each block's contribution as its cost change
+from a fixed reference layout; these differences can be negative. Keep
+shared variables consistent across factors. Contracting attributes into
+consecutive blocks requires a proof that it preserves an optimum.
 
-One construction uses a reference permutation for every block. Let $c$
-be the reference cost and let $g_B$ be the change from permuting only block
-$B$. These differences can be negative; their sum with $c$ is the original
-nonnegative cost. A source block discarded in its entirety has no internal
-permutation effect and can be removed from that factor's scope.
+## Cutset enumeration
 
-For a fixed shared key permutation $q$, target $\tau$, and orientation,
-an independent two-child tree transition can therefore minimize the left
-and right value permutations separately:
-
-$$
-\begin{aligned}
-F_C(\tau)=\min_{q,o}\bigl[&c(q,o,\tau)\\
- &+\min_p\{F_A(q,p)+g_L(p,q,o,\tau)\}\\
- &+\min_t\{F_B(q,t)+g_R(t,q,o,\tau)\}\bigr].
-\end{aligned}
-$$
-
-This changes a product of the two value-domain sizes into a sum for that
-transition. In the general graph, preserve the shared target, key, and
-orientation variables in the smaller factors. It is not valid to minimize
-each consumer independently or to assume the decomposition for an
-arbitrary replacement cost model.
-
-#### Cache local tables and conditional messages
-
-A factor depends only on its scope. Cache its cost table once when it is
-small enough, and reuse it across cut assignments. A conditioned message
-need only be recomputed when cut variables in its dependency set change.
-Keep those variables as message parameters when their combined domain
-fits the memory budget. This trades larger tables for fewer repeated DPs.
-
-#### Optional raw-I distance transform
-
-For full permutations of $m$ binary fields, swapping adjacent attribute
-positions $i,i+1$, counted from zero, has record-inversion cost
-
-$$
-w_i=2^{2m-i-4}.
-$$
-
-The shortest-path distance on this weighted permutation graph is exactly
-full-field $I$. Record-order Kendall distance gives the lower bound.
-Moving each next target field left into its target-prefix position fixes
-only record pairs that disagree with the final target order, attaining
-that bound.
-
-Consequently, a transition of the form
-
-$$
-F(\tau)=\min_\sigma\{G(\sigma)+I(\sigma,\tau)\}
-$$
-
-can use a multi-source shortest-path transform over $m!$ permutations.
-Initialize legal source states with $G$ and read out legal target states.
-Intermediate permutation-graph states are calculation states, not new
-physical layouts, so they need not satisfy arrangement K/V constraints.
-
-For a projected target, read out the minimum over all completions
-$\tau\Vert\delta$ of its dropped fields. For each source, its own
-source-relative dropped suffix attains the projected cost; another suffix
-can only add inversions between equal projected records. This makes the
-transform exact for the projection convention as well.
-
-The transform can avoid a dense source-by-target table. It does not
-remove graph cycles or separator variables. It is an optional cost-specific
-optimization; the generic forest DP does not depend on it.
-
-### 5. Find a cutset, then enumerate its assignments
-
-When the factor graph contains undirected cycles, choose a set $S$ of
-**variable nodes** such that deleting those nodes and their incident
-edges leaves a forest. This is a cycle cutset, not a set of discarded
-operators or costs.
-
-For every assignment $s$ to $S$, substitute its states in all factors.
-A factor with no remaining variables becomes a scalar cost and is still
-included. Run the forest DP on the remaining graph and take
-
-$$
-\operatorname{OPT}=\min_{s\in\prod_{x\in S}\mathcal L_x}
-\operatorname{ForestOPT}(s).
-$$
-
-Every complete assignment has exactly one restriction to $S$, so exhaustive
-cut enumeration plus exact forest DP gives an exact solution of the
-original finite model. The cut need not be minimum for this guarantee.
-Choosing a smaller cut makes solving cheaper; it does not improve the
-best attainable objective value.
-
-The number of outer assignments is
+Choose variable nodes $S$ whose removal leaves a forest. For every
+assignment to $S$, substitute those states in all factors, solve the
+remaining forest, and keep the cheapest result. Factors with no remaining
+variables still contribute scalar costs. The outer assignment count is
 
 $$
 P(S)=\prod_{x\in S}d_x.
 $$
 
-Prefer a cut with small domain product, equivalently small
-$\sum_{x\in S}\log d_x$, rather than few variables. A two-state key
-permutation and a 720-state full-row permutation have very different
-enumeration costs. The cut may contain key, value, full-row, or orientation
-variables. Fixing a logical IDB's row order does not also fix all its
-different arrangements.
+Find a small-product cut rather than merely a small number of variables:
+conditioning a two-state block is cheaper than a 720-state row layout.
+The cut may contain key, value, row-layout, or orientation variables.
+Fixing recursive IDB rows alone may leave arrangement cycles.
 
-#### A feasible greedy cut
+### Finding the cut
 
-Let $\beta=|E|-|V|+\text{components}$ be the cycle rank of the current
-undirected incidence graph. While $\beta>0$, choose a variable whose
-deletion reduces $\beta$, favoring a large reduction per $\log d_x$ paid.
-Afterward, remove redundant cut variables whenever the residual graph
-remains a forest. This gives a feasible incumbent without a claim of an
-approximation ratio.
+First obtain a feasible cut greedily: repeatedly delete a variable that
+removes many independent cycles per $\log d_x$ paid, then remove redundant
+choices. Improve or certify it with branch and bound:
 
-#### Exact branch and bound
+1. Find a remaining cycle.
+2. Branch on each variable in that cycle: every cut must select one.
+3. Prune products that cannot beat the incumbent. Disjoint-variable cycles
+   give a lower bound by multiplying their smallest domain sizes.
+4. Record a cut when no cycle remains.
 
-To improve or certify that incumbent:
+Keep factor identities fixed during search so the cycle certificates
+remain valid. Memoize selected-variable sets. For $n$ candidate variables,
+exhaustive search can visit $2^n$ subsets; a search limit can return a
+valid cut without proving it minimum.
 
-1. Find a cycle in the remaining incidence graph.
-2. Branch on selecting each variable node on that cycle. Every valid
-   completion must select at least one of them.
-3. Multiply the current domain product by the selected variable's domain.
-   Prune when a lower bound cannot beat the incumbent product.
-4. If there is no cycle, record the feasible cut.
+**Any valid cut gives the optimal modeled layout if all its assignments
+are solved exactly.** Minimum cut product only reduces work. It need not
+minimize total DP work, so also compare residual table sizes. For global
+optimality across strata, retain shared boundary states or pass joint
+boundary messages; solving strata with frozen boundaries is conditional
+optimization.
 
-A lower bound comes from a collection of cycles with disjoint variable
-sets: multiply the smallest domain size on each cycle. A cut must pay for
-at least one distinct variable per such cycle. Memoizing selected-variable
-sets avoids visiting the same subproblem through different branch orders.
+## Optimization cost
 
-Keep factor identities fixed during this search. In particular, do not
-dynamically merge equal or contained scopes after conditioning and then
-use an old cycle as a branching certificate: changing the graph can
-invalidate the argument that the selected cycle must be hit. Exact factor
-simplifications may be done before search; verify the forest condition on
-the resulting fixed graph.
-
-An exhausted search proves minimum $P(S)$ for this fixed factorization and
-choice of variable domains. A bounded search may return an uncertified but
-valid cut; exhaustive assignment enumeration over that cut still yields
-the optimal layout. Stopping the **layout enumeration** early is different
-and forfeits that guarantee.
-
-The smallest domain product need not minimize total solver work. Compare
-candidate cuts using their residual transition sizes and peak tables as
-well. A larger cut may shrink expensive factors enough to be preferable.
-
-### 6. Complexity and the scope of optimality
-
-Let $X_f$ be the variables in factor $f$, $r_f=|X_f|$, and
-$A_f=\prod_{x\in X_f}d_x$. Let $\kappa_f$ be the work needed to evaluate
-one entry of its cost table. A direct dense construction costs
-
-$$
-B=O\left(\sum_f\kappa_f A_f\right).
-$$
-
-For a fixed cut $S$, put $A_f(S)=\prod_{x\in X_f\setminus S}d_x$.
-With cached factor values, one inward forest pass has the bound
-
-$$
-T(S)=O\left(
-\sum_f\max(1,r_f)A_f(S)+
-\sum_{x\notin S}\deg(x)d_x
-\right).
-$$
-
-The factor term includes scanning state combinations and adding incoming
-messages; it also includes scalar factors. Variable messages sum incoming
-tables. With $Q_{\mathrm{cut}}$ graph-search work, the uncached-message
-outer scheme has the bound
-
-$$
-O\left(Q_{\mathrm{cut}}+B+P(S)T(S)\right).
-$$
-
-If full tables are too large, evaluate entries on demand; then their
-evaluation cost reappears in the repeated DP term. Dense factor storage
-is $O(\sum_f A_f)$, with additional message tables and backpointers.
-Cut assignments can be processed one at a time. A small cut product does
-not by itself bound the largest local table or total memory use.
-
-Disconnected components must be counted separately:
-
-$$
-\sum_H\left[B_H+P(S_H)T_H(S_H)\right],
-$$
-
-plus cut-search work. Multiplying cut domains from unrelated components
-creates avoidable repeated work.
-
-#### Factorials in a join transition
-
-For a join with $k$ key fields, $l$ left-value fields, and $r$ right-value
-fields, there are at most $2k!l!r!$ nominal source layouts, including
-orientation. If its target has $D$ legal layouts, direct forward
-enumeration needs
+For a join with $k$ key, $l$ left-value, and $r$ right-value fields, and
+$D$ target layouts, direct transition enumeration costs
 
 $$
 O\left(\kappa(m)Dk!l!r!\right),\qquad m=k+l+r,
 $$
 
-with the factor of two suppressed. A target arrangement has
-$D=k_{\mathrm{out}}!v_{\mathrm{out}}!$; a free projected row with $p$
-distinct fields has $D=p!$. The source width $m$ includes projected-away
-fields.
-
-The orientation factor of two is local to each join transition. It does
-not require an outer enumeration of all joins' orientation combinations.
-When orientation occurs in only one factor, minimize its two choices
-inside that factor before cut search. When several factors depend on the
-same orientation, keep their choice consistent; minimizing each factor's
-orientation independently would solve a different problem.
-
-When the raw-I block decomposition and independent child messages apply,
-the forward transition becomes
+where $\kappa(m)$ is one cost evaluation. Trying both orientations adds
+local factor 2. With the source-block decomposition and independent child
+messages, the value-domain product becomes a sum:
 
 $$
 O\left(\kappa(m)Dk!(l!+r!)\right).
 $$
 
-In a budget charging $m$ units per cost evaluation, this is the shorthand
-$mDk!(l!+r!)$. That accounting convention must be distinguished from the
-actual complexity of the chosen cost oracle. Reverse messages and factors
-with other shared interfaces are budgeted from their actual scopes;
-the forward formula is not a universal bound on every graph transition.
+For a target arrangement, $D=k_{\mathrm{out}}!v_{\mathrm{out}}!$; for a
+free projected row with $p$ fields, $D=p!$. The source width $m$ includes
+dropped fields.
+General factor transitions enumerate their actual scopes, including
+shared variables when solving against dataflow.
 
-The optional distance transform instead has $m!$ states and
-$(m-1)m!$ directed neighbor relaxations. With a binary heap, its bound is
-$O(mm!\log(m!))$ plus seeding, target readout, and permutation-indexing
-work. Distances need $O(m!)$ entries; edges need not be materialized.
-For distinct retained fields, enumerating all dropped-suffix completions
-across legal target prefixes visits at most $m!$ states. This is useful
-only when that full-origin permutation space fits the budget.
+### Counting the benchmark plans
 
-#### Cut search and strata
+The following analysis covers **16 queries, 82 strata, and 55 datasets**
+from main at [5d345922][cost-baseline]. Layout work is counted once per
+query. Both configurations use per-stratum contraction, full-row
+elimination, source-block decomposition, and free imported layouts.
+One fixes join directions; the other includes their orientation variables.
 
-Finding a minimum-product cut is itself an exponential search in the
-worst case. Memoized exhaustive search has at most $2^n$ selected-variable
-subsets for $n$ candidate variables, with polynomial graph work per state.
-A greedy incumbent and lower bounds reduce practical work but give no
-polynomial worst-case guarantee. Apply a graph-search budget separately
-from the budget for enumerating layout states.
-
-A coarse alternative fixes every recursive IDB row layout, incurring a
-factor $\prod_R \operatorname{arity}(R)!$. It can be much larger than a
-cut over a few two-state physical block variables, and may still leave
-undirected cycles involving arrangements or reconverging consumers.
-Validate the forest condition rather than assuming IDB enumeration is
-sufficient.
-
-Per-stratum optimization is exact **conditional on its boundary layouts**.
-Freezing imported/exported layouts while solving strata in some order is
-a coordination heuristic. For a global guarantee, either solve the graph
-including cross-stratum boundary variables or pass exact cost messages
-over their joint assignments. A multi-variable boundary can require a
-product-sized separator table. Neither reverse stratum order nor a
-particular root choice removes this coupling.
-
-Likewise, forcing a group of attributes to stay consecutive is an exact
-reduction only if a property of all incident factors and constraints
-proves that an optimum with that restriction exists. Merely observing
-no explicit precedence between two fields is insufficient. An unproved
-contraction is a restricted-domain heuristic and must be reported as such.
-
-### 7. Cutset and DP cost on benchmark plans
-
-The earlier analysis covered **16 query plans, 82 strata, and 55 datasets**
-from main at
-[`5d345922`](https://github.com/flowlog-rs/flowlog/commit/5d345922654a6ded5a296511a3d07d898a258adb).
-Multiple datasets of one query share the same layout problem, so work is
-counted once per query. The tables below give both the archived
-fixed-orientation counts and a recount allowing join-side swaps on those
-same plans.
-
-Both configurations use per-stratum field contraction, full-row
-intermediate-layout elimination, additive source-block factorization, and
-independent connected components. Each stratum's imported layouts are
-free. The free-orientation configuration adds a two-state variable for
-each modeled swappable join, shared by all factors depending on that
-join. Antijoins retain their required orientation.
-
-These are structural optimization budgets for the reduced per-stratum
-model, not runtime measurements or computed minimum values of $I$.
-The contraction and boundary assumptions are part of that model; the
-counts do not establish an unrestricted cross-stratum optimum.
-
-#### Counting convention
-
-Charge $m_f$ units per factor-table entry. For the residual DP, count state
-assignments visited by a selected variable-elimination order:
+Using the earlier structural budget, for each independent component $H$:
 
 $$
-\begin{aligned}
-B_H&=\sum_{f\in H}m_f\prod_{x\in X_f}d_x,\\
-P_H&=\prod_{x\in S_H}d_x,\\
-T_H^{\mathrm{VE}}&=
-\sum_{\text{elimination bags }b}\prod_{x\in b}d_x,\\
-W&=\sum_H\left[B_H+P_HT_H^{\mathrm{VE}}\right].
-\end{aligned}
+B_H=\sum_{f\in H}m_f\prod_{x\in X_f}d_x,\qquad
+T_H=\sum_{\text{elimination bags }b}\prod_{x\in b}d_x,
 $$
 
-Each factor table is budgeted once. For each component, choose the
-smallest state budget among three elimination-order heuristics, after
-conditioning a minimum-product cut. A separate reconstruction of every
-elimination bag verifies the reported totals. All 82 fixed-orientation
-rows reproduce the archived analysis exactly.
+$$
+W=\sum_H\left[B_H+P(S_H)T_H\right].
+$$
 
-This preserves the earlier accounting convention. An elimination-bag
-assignment differs from a factor-table visit in the forest-message bound
-in section 6. Degree-based arithmetic, graph-search operations, scalar
-lookups, and outer minimum scans are excluded from this budget. Those
-last two counters are retained separately in the CSV.
+$X_f$ is a factor's variable scope. Cache its table once in $B_H$; $T_H$
+counts residual DP state assignments using the cheapest of three tested
+elimination-order heuristics. This budget charges $m_f$ per table entry;
+it is not elapsed time or a literal operation count. Degree-based
+arithmetic and cut-search work are excluded; scalar lookups and outer
+minimum scans are recorded separately in the CSV.
 
-#### Results by query
-
-Both configurations have **62 strata already forming forests**, and all
-cut searches proved the minimum domain product for their fixed factor
-graphs. The largest independent-component cut product is **64** with
-fixed orientation and **2,048** with free orientation.
-
-The construction and repeated-DP columns below use free orientation;
-the fixed-total column reproduces the earlier result. The cut column is
-the largest product in an individual connected component, not a product
-across unrelated components.
+All cuts were proved minimum-product for their factor graphs. Both modes
+have **62 strata already forming forests**. Table entries below were
+checked by independently reconstructing the elimination bags; the fixed
+counts also reproduce the earlier analysis. Construction and DP columns
+refer to free orientation; the cut column is the largest independent
+component product.
 
 | Query | Datasets | Fixed total | Free construction | Free DP | Free total | Max free cut product |
 |---|---:|---:|---:|---:|---:|---:|
@@ -980,25 +350,20 @@ across unrelated components.
 | DOOP | 20 | 236,724 | 196,458 | 48,782 | 245,240 | 4 |
 | **Total** | **55** | **90,698,026** | **77,757,814** | **148,225,230** | **225,983,044** | **2,048** |
 
-The free-orientation budget is **225,983,044**, versus **90,698,026** with
-fixed orientation, or **2.49 times** the earlier budget. Trying two
-orientations doubles a local join trial. In this source-block factorization,
-the common orientation variable can also enlarge the cut product and
-repeated DP work; the complete budget is not obtained by doubling every
-entry in the old table. This is the cost of the stated factorization and
-cut-enumeration schedule, not a lower bound on every possible solver.
+Allowing orientations gives total budget **225,983,044**, versus
+**90,698,026** with fixed directions. Although a local join trial doubles,
+a shared orientation can also enlarge the cut and repeated DP work in
+this factorization. The resulting 2.49-times budget describes this
+schedule, not a lower bound on every solver.
 
-The [per-stratum CSV](attribute-layout-cutset-costs.csv) contains all
-**164 stratum/configuration rows**, with `orientation-fixed` and
-`orientation-free` modes. `outer_product` is the combined product across
-all cut variables of a stratum; `max_component_outer` is the largest
-component product. `cached_budget` sums components independently.
-State-table sizes count entries, not bytes or process RSS.
+The [CSV](attribute-layout-cutset-costs.csv) contains both modes for all
+82 strata. `outer_product` combines all cut domains within a stratum;
+`max_component_outer` is the largest component product. Budgets enumerate
+independent components separately. Table sizes count states, not bytes.
 
-#### CVC5 and Z3
+### Where the cost is concentrated
 
-These two queries have identical layout-problem structure in this
-analysis. For either query, the per-stratum budgets are:
+CVC5 and Z3 have identical structure here. For either query:
 
 | Stratum | Fixed total | Free construction | Free DP | Free total | Free combined cut product |
 |---|---:|---:|---:|---:|---:|
@@ -1010,159 +375,65 @@ analysis. For either query, the per-stratum budgets are:
 | 5 | 3,162 | 2,134 | 1,360 | 3,494 | 4 |
 | 6 | 1,547,772 | 2,111,364 | 3,901,248 | 6,012,612 | 32 |
 
-In the free-orientation configuration, stratum 0 contributes about
-**83.5%** of each query's total budget. Its largest local factor contains
-**2,073,600 states**, despite its cut product being only 12. A small cut
-controls outer repetition; it does not remove large local transitions.
+Stratum 0 contributes **83.5%** of the free-orientation budget. Its largest
+factor has **2,073,600 states**, despite cut product 12. Small cuts reduce
+outer repetition but do not remove large local transitions.
 
-Stratum 2 illustrates the orientation-related increase: its cut grows
-from six to eleven two-state variables, so the product grows from
-$2^6=64$ to $2^{11}=2{,}048$. Its cached budget grows from 367,067 to
-12,553,451. This is still much smaller than the outer enumeration of all
-five recursive IDB row layouts:
+In stratum 2, the cut grows from six to eleven two-state variables:
+$64\to2{,}048$ assignments. Its budget grows from 367,067 to 12,553,451.
+Enumerating all five recursive IDB row layouts would instead require
+$3!\times4!\times3!\times4!\times5!=2{,}488{,}320$ assignments and
+still require checking remaining arrangement cycles.
 
-$$
-3!\times4!\times3!\times4!\times5!=2{,}488{,}320.
-$$
-
-That IDB-only enumeration would also require checking for remaining
-arrangement coupling. Selecting a cut over physical layout variables
-avoids paying that full product.
-
-DOOP's final stratum has 147 nontrivial variables, including orientation,
-and 137 factors. Its cycle rank is 4. A three-variable cut has combined
-product 8, with largest independent component product 4; its budget is
-11,679. The full DOOP query totals 245,240. This shows why graph size
-alone is a poor estimate of cut-enumeration work.
+DOOP's final stratum has 147 variables and 137 factors, but cycle rank 4.
+A three-variable cut has combined product 8, largest component product 4,
+and budget 11,679. Its full query budget is 245,240.
 
 ## Implementation proposal
 
-This section proposes an implementation; the preceding sections define
-the algorithm independently of compiler data structures.
+Add a physical-layout pass in `flowlog-planner` after transformations and
+sharing identities are available, before code generation. Keep the
+existing join tree and runtime operator structure.
 
-### Placement and representation
-
-Add a physical-layout planning pass in `flowlog-planner`, after the
-existing transformations and actual sharing identities are available and
-before `flowlog-codegen` emits tuple accesses. Keep the existing join tree
-and operator structure. The initial pass should choose layouts and legal
-join orientations without inserting or deleting runtime dedups or
-arrangements.
-
-Introduce a proposed `PhysicalLayoutPlan` carrying the selected field
-permutations, join orientations, and conversions for each physical
-representation. Keep logical attribute identity separate from physical
-tuple position. A representation identity must include its scope and
-actual sharing identity; a relation name alone cannot identify a trace.
-Recursive feedback within a stratum and a completed relation exposed to a
-later stratum must remain distinct where the current planner distinguishes
-them. See [the scope of canonical sharing](canonical-form.md#scope-the-one-assumption-a-caller-can-break).
-
-Extract a solver model with these records:
-
-- Layout variables with legal permutation domains and any pinned states.
-- Join metadata with common key origins, input value origins, and legal
-  orientations.
-- Sorting factors with stable identities, variable scopes, and composed
-  source-to-target origin mappings, including dropped origins for scoring.
-- Representation and boundary mappings that let a winning assignment be
-  translated back into the existing plan.
-
-Do not identify arrangements solely because their canonical logical rows
-agree. Their physical key membership, layout, scope, and runtime sharing
-must also be compatible. If applying a layout changes representation
-fingerprints, regenerate dependent references consistently or retain a
-separate physical identity layer.
-
-### Solver components
-
-Separate graph extraction, cost evaluation, cut selection, forest solving,
-and plan application. A practical implementation sequence is:
-
-1. Implement the generic finite-domain factor model and raw-I oracle,
-   including projection completion and composed mappings. Retain a direct
-   evaluator as the reference for optimized cost calculations.
-2. Implement exact forest messages with backpointers. Test every rooting
-   direction of a binary join, not only forward transitions.
-3. Add singleton substitution, shared-key aliases, independent components,
-   and the proven full-row and source-block reductions. Validate that
-   their reconstructed assignments reproduce the unreduced objective.
-4. Add greedy cut selection and bounded branch and bound, retaining a
-   verified feasible cut at all times. Report whether minimum cut product
-   was proved independently of whether layout enumeration was exhaustive.
-5. Cache local tables subject to explicit entry and byte budgets. Cache
-   conditional messages by the cut variables they actually depend on.
-   Consider the distance transform only after the generic solver is
-   validated and dense transitions are shown to dominate planning work.
-
-Use deterministic state ordering and prefer the existing main layout and
-orientation among equal-score solutions. Cost arithmetic must be exact
-over supported widths and sums, including negative reference-difference
-factors; detect unsupported ranges rather than silently wrapping or
-conflating overflow with a legal score.
-
-Initially, a per-stratum deployment can pin already established boundary
-layouts and clearly report conditional optimality. A later global mode
-can retain boundary variables and their separator messages. Do not label
-the former globally optimal or treat a frozen interface as if it had been
-minimized jointly with its consumers.
-
-### Applying and validating the result
-
-Have code generation consume the selected physical plan when constructing
-arrangement tuples, join key/value accesses, projections, head unions,
-and feedback bindings. Rewrite all contributors to a shared head into the
-same selected physical schema. Restore required external argument order
-at input/output boundaries. Preserve set membership, signed updates,
-aggregate semantics, and timestamp handling.
-
-The first implementation should keep opaque computed expressions and
-operators without an established layout contract at their existing legal
-layout. Aggregate grouping inputs can use the composed projection of
-their non-aggregate fields for alignment; aggregate payloads and result
-fields need their own origin and ordering contract before they become
-free variables.
-
-Validate the optimizer at three levels:
-
-- Compare raw-I formulas with explicit binary-record enumeration, including
-  empty and partial projections, renamed fields, repeated references, and
-  composed projection chains. Constants do not affect a comparator;
-  repeated origins use their first effective comparison position.
-- On small complete models, compare forest DP and cut-conditioned DP with
-  exhaustive assignments. Include reverse join messages, both join
-  orientations, multiple head producers, reconverging branches, separate
-  arrangements of one relation, and recursive boundary variables.
-- Run the repository's correctness suites, then compare generated physical
-  plans and performance against the same main revision. Recompute the
-  full unreduced objective from the applied layout, and verify every
-  shared key, mapping, and external schema before benchmarking.
-
-Expose planning diagnostics: state-domain sizes, graph components, cut
-variables and domain product, cut-search proof status, factor/message
-entries, cost-evaluation counts, planning time, and the selected objective.
-If a solver budget forces a heuristic fallback, preserve a complete legal
-assignment and report the loss of the layout-optimality guarantee.
+1. **Extract the model.** Assign stable origin IDs; compose field mappings;
+   create layout domains, shared-key variables, orientation variables, and
+   cost factors. Identify each physical representation by its actual scope
+   and sharing identity, not only its relation name.
+2. **Solve it.** Apply exact reductions, select cuts, enumerate assignments,
+   and run forest messages with backpointers. Cache tables within explicit
+   memory limits. Use exact cost arithmetic, including signed terms from
+   source-block decomposition. On ties, prefer main's existing assignment.
+3. **Apply a physical plan.** A proposed `PhysicalLayoutPlan` stores chosen
+   permutations and orientations. `flowlog-codegen` uses it for tuple
+   construction, accesses, head unions, and feedback. Update dependent
+   references consistently, restore required external schemas, and preserve
+   mutability, aggregate, and timestamp semantics.
+4. **Handle boundaries explicitly.** Pin unsupported expression layouts.
+   Aggregate grouping inputs can use their non-aggregate projection;
+   payload and result fields need their own layout contract. Per-stratum
+   solving must report whether boundary layouts were fixed or optimized
+   jointly. Respect [canonical sharing's scope](canonical-form.md#scope-the-one-assumption-a-caller-can-break).
+5. **Validate and expose diagnostics.** Compare costs with binary-record
+   enumeration and small DP solutions with exhaustive assignments,
+   including reverse join transitions, projections, union, and shared
+   branches. Recompute the full objective after applying the plan. Run
+   correctness suites and benchmark against the same main revision.
+   Report cut products, proof status, table sizes, planning time, and any
+   fallback that gives up exhaustive layout optimization.
 
 ## Experimental context
 
-The motivating full-suite comparison used main at [44ad2c5d][baseline]
-and the rule-head field-order experiment at [d6ae8553][experiment]. It
-covered 55 workloads with five fresh runs per version, 32 workers on one
-NUMA node, and median execution time. The reported execution interval
-included dataflow assembly, input loading, and execution; it excluded
-compilation. The Jython numbers above refer to that comparison. The
-Scallop and Z3 explanations use earlier profiles and layout experiments.
+The Jython timing above comes from a 55-workload comparison of main
+[44ad2c5d][baseline] and the field-order experiment [d6ae8553][experiment]:
+five measured runs, medians, and 32 workers on one NUMA node. It measures
+whole-program execution, including assembly and loading, not compilation.
+Scallop and Z3 refer to earlier profiles. These timings are separate from
+the structural optimizer budgets above.
 
-These observations motivate the assignment problem; they are not
-measurements of the current main branch. This description does not add
-new benchmark runs or claim that one layout improves every workload.
-
-Related FlowLog documentation:
-
-- [Canonical form and the physical plan](canonical-form.md).
-- [Mutability, collection semantics, and deduplication](mutability.md).
+Related documentation: [canonical form](canonical-form.md) and
+[mutability and deduplication](mutability.md).
 
 [field-order-pr]: https://github.com/flowlog-rs/flowlog/pull/418
 [baseline]: https://github.com/flowlog-rs/flowlog/commit/44ad2c5d
 [experiment]: https://github.com/altramarine/flowlog/commit/d6ae8553f67861b43b15a697fb0016bb42be26e0
+[cost-baseline]: https://github.com/flowlog-rs/flowlog/commit/5d345922654a6ded5a296511a3d07d898a258adb
