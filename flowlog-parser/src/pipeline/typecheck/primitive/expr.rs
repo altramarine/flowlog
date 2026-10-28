@@ -55,9 +55,30 @@ fn infer_factor(
         Factor::Const(c) => Some(c.ty().clone()),
         Factor::FnCall(fc) => Some(infer_fn_call(fc, bindings, udfs)?),
         Factor::Builtin(bc) => Some(infer_builtin_call(bc, bindings, udfs)?),
-        // Primitive layer sees through casts; the `subtype` pass
-        // enforces the cast rules separately.
-        Factor::Cast(c) => infer_factor(c.inner(), bindings, udfs)?,
+        // A cast types a literal-typed operand (a numeric literal, or a count
+        // or mean no use has fixed yet) as its target's primitive root, so
+        // the cast, not the expression around it, fixes the operand's width.
+        // Any other operand keeps its own type, and the `subtype` pass checks
+        // a variable bound by an atom against the target. Typing every
+        // operand as the target would make `as(strlen(s), int64)` compute in
+        // `int64`, but it would also reject `to_string(as(n, int64))` for a
+        // count `n`, which runs correctly today: a count's width does not
+        // follow a cast nested inside a call. So a non-literal operand still
+        // computes at its own width, `int32` for `strlen`, under the cast.
+        Factor::Cast(c) => match infer_factor(c.inner(), bindings, udfs)? {
+            Some(family) if family.is_literal() => {
+                let root = c.target()?.root();
+                if !family.fits(root) {
+                    return Err(ParseError::IllegalCast {
+                        span: c.span(),
+                        from: family.to_string(),
+                        to: c.target_type().to_string(),
+                    });
+                }
+                Some(root.clone())
+            }
+            inner => inner,
+        },
         Factor::Group(a) => infer_expr(a, bindings, udfs)?,
         // Tuple construct `(e0, ...)`: the type is the fixed tuple of the
         // fields' concrete types.
@@ -242,8 +263,10 @@ fn pin_factor(
         Factor::Var(_) => Ok(()),
         Factor::FnCall(fc) => pin_fn_call(fc, bindings, udfs),
         Factor::Builtin(bc) => pin_builtin_call(bc, bindings, udfs),
-        // Cast asserts its inner has the target's primitive, so pin
-        // polymorphic literals inside accordingly.
+        // The enclosing context pinned this expression to the type
+        // `infer_factor` gave the cast: its target's root for a literal-typed
+        // operand, the operand's own type otherwise. Either way `target` is
+        // the width the operand's literals take.
         Factor::Cast(c) => pin_factor(c.inner_mut(), target, span, bindings, udfs),
         Factor::Group(a) => pin_expr(a, target, bindings, udfs),
         // Tuple construct: pin each field against its declared field type.
@@ -299,6 +322,7 @@ fn pin_fn_call(fc: &mut FnCall, bindings: &Bindings, udfs: &UdfSigs) -> Result<(
 #[cfg(test)]
 mod tests {
     use flowlog_common::Span;
+    use rstest::rstest;
 
     use super::*;
     use crate::ArithmeticOperator;
@@ -307,6 +331,7 @@ mod tests {
     use crate::Factor;
     use crate::HeadArg;
     use crate::ParseError;
+    use crate::Predicate;
     use crate::assert_err;
     use crate::test_harness::checked;
 
@@ -489,5 +514,101 @@ mod tests {
             Err(ParseError::TupleDestructure { .. }) => {}
             other => panic!("expected a clean TupleDestructure error, got {other:?}"),
         }
+    }
+
+    /// Returns a program whose one rule filters an `int32` input by
+    /// `comparison`, with `Big`, a subtype of `int64`, declared to cast to.
+    fn filtered_by(comparison: &str) -> String {
+        format!(
+            ".type Big <: int64\n\
+             .decl K(x: int32)\n\
+             .decl O(x: int32)\n\
+             .input K(IO=\"file\", filename=\"K.csv\", delimiter=\",\")\n\
+             .output O\n\
+             O(x) :- K(x), {comparison}.\n"
+        )
+    }
+
+    /// A cast, not its context, fixes a literal operand's width: compared
+    /// only with literals, the operand takes the cast's width rather than
+    /// the default `int32` or `f32`.
+    // Cases: comparison, cast literal once pinned.
+    #[rstest]
+    #[case::int64_shift("as(1, int64) bshl 31 > 0", Constant::new(DataType::Int64, "1"))]
+    #[case::int64_above_int32(
+        "as(3000000000, int64) > 0",
+        Constant::new(DataType::Int64, "3000000000")
+    )]
+    #[case::uint64_above_int32(
+        "as(3000000000, uint64) > 0",
+        Constant::new(DataType::UInt64, "3000000000")
+    )]
+    #[case::float64("as(1.5, f64) > 0.0", Constant::new(DataType::Float64, "1.5"))]
+    #[case::subtype(
+        "as(3000000000, Big) > 0",
+        Constant::new(DataType::Int64, "3000000000")
+    )]
+    fn cast_literal_pinned_to_target_primitive(
+        #[case] comparison: &str,
+        #[case] literal: Constant,
+    ) {
+        let program = checked(&filtered_by(comparison)).unwrap();
+        let cmp = match &program.rules()[0].rhs()[1] {
+            Predicate::Compare(c) => c,
+            other => panic!("expected comparison, got {other:?}"),
+        };
+        assert_eq!(cmp.left().init(), &Factor::Const(literal));
+    }
+
+    /// A cast literal must fit its target's width, as a literal in a column
+    /// of that type must: `300` fits the default `int32` but not
+    /// `as(300, int8)`.
+    #[test]
+    fn cast_literal_out_of_target_range_rejected() {
+        assert_err!(
+            checked(&filtered_by("as(300, int8) > 0")),
+            ParseError::LiteralOutOfRange { literal, target: DataType::Int8, .. }
+                if literal == "300"
+        );
+    }
+
+    /// `as()` is a runtime no-op, not a conversion, so a literal keeps its
+    /// family: the error names the literal's family, not its default width.
+    // Cases: comparison, from, to.
+    #[rstest]
+    #[case::integer_to_float("as(1, f64) > 0.5", "integer literal", "f64")]
+    #[case::float_to_integer("as(1.5, int64) > 0", "float literal", "int64")]
+    fn cast_literal_across_primitive_roots_rejected(
+        #[case] comparison: &str,
+        #[case] expected_from: &str,
+        #[case] expected_to: &str,
+    ) {
+        assert_err!(
+            checked(&filtered_by(comparison)),
+            ParseError::IllegalCast { from, to, .. }
+                if from == expected_from && to == expected_to
+        );
+    }
+
+    /// A count is typed like a literal until a use fixes its width, so a
+    /// cast on it is such a use: the shift amount beside it takes `int64`.
+    #[test]
+    fn cast_fixes_count_width() {
+        let program = checked(&filtered_by(
+            "n = count : { K(y) }, as(n, int64) bshl 31 > 0",
+        ))
+        .unwrap();
+        let cmp = program.rules()[0]
+            .rhs()
+            .iter()
+            .find_map(|predicate| match predicate {
+                Predicate::Compare(c) => Some(c),
+                _ => None,
+            })
+            .expect("the rule keeps its comparison");
+        assert_eq!(
+            cmp.left().rest()[0].1,
+            Factor::Const(Constant::new(DataType::Int64, "31"))
+        );
     }
 }
