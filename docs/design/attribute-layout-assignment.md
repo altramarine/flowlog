@@ -366,33 +366,142 @@ existing join tree and runtime operator structure.
 
 ## Appendix A: Case studies
 
+These historical experiments illustrate layout trade-offs. Their runtime
+observations are separate from the proposed DP and its state-count analysis.
+
 ### DOOP/Jython: head and downstream layouts
 
-The DOOP/Jython propagation rule is:
+Consider the points-to propagation rule:
 
 ```prolog
 VarPointsTo(heap,to) :- Assign(from,to), VarPointsTo(heap,from).
 ```
 
-With `Assign` on the left, the nominal join order is:
+With `Assign` on the left, the join inputs have:
 
 ```text
-K=(from), LV=(to), RV=(heap)
-source: (from,to,heap)
-projected head: (heap,to)
+left:  K=(from), V=(to)
+right: K=(from), V=(heap)
 ```
 
-A head layout `(to,heap)` better follows that traversal, but some consumers
-need heap-first arrangements. Swapping the join inputs changes the
-nominal source to `(from,heap,to)`. The optimizer must consider both
-upstreams, the head, and its consumers together.
+After dropping `from`, `(to,heap)` follows the left-value/right-value
+model, while the user-written head is `(heap,to)`.
 
-The rule-head field-order experiment in [PR #418][field-order-pr] reduced
-whole-program Jython time from about 315s to 214s. Other workloads exposed
-conflicts: Scallop's large seed favored a different layout from its joins,
-and Z3's locally attractive head layout made recursive block-key indexes
-more expensive. These motivate a global assignment rather than choosing
-one upstream's preferred order.
+```text
+experimental physical path:
+join -> (to,heap) -> ordinary dedup -> restore (heap,to)
+
+broader layout opportunity:
+join -> (to,heap) -> ordinary dedup -> retain that layout for consumers
+```
+
+In the full-suite comparison described below, DOOP/Jython execution time
+decreased from approximately **315 seconds to 214 seconds** with the field-order
+implementation. This is a whole-program result involving multiple heads;
+it is not an isolated timing of this rule or of sorting alone.
+
+The local benefit has a downstream cost. Some consumers need an arrangement
+whose complete key is `(heap,var)`. Restoring logical field positions with
+a map does not restore the previous sorted order or worker partition.
+Earlier DOOP profiles showed that a cheaper VarPointsTo head could coexist
+with a more expensive downstream full-key arrangement.
+
+The assignment should account for both kinds of consumers. It may be useful
+to keep a variable-first primary layout, use a heap-first view where needed,
+or choose another shared layout. Each conversion or additional view has a
+cost. Changing the input orientation can also change which retained value
+comes first, so a layout preference is conditional on the chosen join plan.
+
+### Scallop: a large seed and conflicting consumers
+
+The Polonius query used by Scallop contains:
+
+```prolog
+subset(o1,o2,p) :- subset_base(o1,o2,p).
+
+subset(o1,o3,p) :-
+    subset(o1,o2,p),
+    subset_base(o2,o3,p),
+    o1 != o3.
+
+subset(o1,o2,p2) :-
+    subset(o1,o2,p1),
+    cfg_edge(p1,p2),
+    origin_live_on_entry(o1,p2),
+    origin_live_on_entry(o2,p2).
+```
+
+The transitive rule joins on `(o2,p)` and retains `p`, the left value `o1`,
+and the right value `o3`. It suggests a point-first head layout. The last
+semijoin in the CFG propagation rule instead suggests `(o2,p2,o1)`.
+
+But this workload has about **27.4 million seed records**, accounting for
+roughly **97% of the input updates to the recursive subset head**. Choosing
+a layout from a smaller join also forces the large seed through that
+layout. The subsequent consumers need several different keys:
+
+```text
+(o2,p), (p), (o1), (o1,p)
+```
+
+The previous exploration found that `(o2,p,o1)` improved the `(o2,p)`
+arrangement relative to the point-first layout, but made the point-only
+arrangement more expensive. It also retained costs at the seed and
+recursive head. Restoring the original layout for the entire subset path
+performed better in that comparison than restoring only the seed layout.
+
+This example requires weighting all producers and consumers by their work:
+seed volume, join updates, recursive iterations, and downstream index
+construction. Picking the first eligible join cannot express that trade-off.
+
+### Z3: rule-head order versus recursive indexes
+
+Abbreviate `Stack_def_use_live_var_at_block_end` as `StackEnd`:
+
+```prolog
+StackEnd(prev,used,reg,pos) :-
+    StackEnd(block,used,reg,pos),
+    !Stack_def_use_ref_in_block(block,reg,pos),
+    !Reg_def_use_defined_in_block(block,reg),
+    Block_next(prev,_,block).
+```
+
+The final join has:
+
+```text
+K=(block), LV=(reg,pos,used), RV=(prev)
+```
+
+The experimental field-order policy selects `(reg,pos,used,prev)` instead
+of the original `(prev,used,reg,pos)`. However, the join key `block` is projected
+away: value order within one block does not imply sorted projected output
+across different blocks. Incremental history replay adds another source
+of variation in emission order.
+
+The head's `prev` becomes the next iteration's `block`. Recursive and later
+consumers need block-leading keys such as `(block,reg,pos)`. Previous profiles
+showed higher costs in the head arrangement, membership threshold, and
+downstream Block indexes after the variable-first layout was introduced.
+
+The assignment must include the cost of the persistent head trace and its
+feedback consumers. Improving a local traversal pattern is insufficient
+if the chosen layout makes these larger or repeated operations more costly.
+
+### Multiple upstreams and shared arrangements
+
+The shared-head example in the [graph model](#multiple-producers-must-agree)
+has two joins favoring different layouts and a seed with its own order.
+
+Selecting the first join's preferred order can benefit that branch while
+reordering the other join and the seed. A downstream consumer can introduce
+a third preference. Choosing a shared layout should consider the volume and
+order properties of every contributor, rather than treating one upstream
+as the representative of the entire relation.
+
+Likewise, a shared intermediate arrangement may serve several joins with
+different preferences. The assignment must decide when a single layout is
+adequate and when another materialized view is worth its memory and update
+cost.
 
 ### CVC5 and Z3: optimizer cost
 
@@ -424,14 +533,60 @@ DOOP's final stratum has 147 variables and 137 factors, but cycle rank 4.
 A three-variable cut has combined product 8, largest component product 4,
 and budget 11,679. Its full query budget is 245,240.
 
+### Galen: savings on the critical worker
+
+A separate Raw I versus Normalized study, based on main
+[5d345922][cost-baseline], examined:
+
+```prolog
+Q(x,e,o) :- Q(x,y,z), R(y,u,e), Q(z,u,o).
+```
+
+The first `Q join R` produces **19,835,387 updates** in every variant.
+`Raw I` uses the binary-record inversion count; `Normalized` uses
+$mI/I_{\max}$, where $m$ is the source width and $I_{\max}$ is the maximum
+for that source width and retained-field count.
+
+| Pipeline active time / s | main | Raw I | Normalized |
+|---|---:|---:|---:|
+| Join plus output arrangement | 4.523 | 2.446 | 4.354 |
+| Internal Join | 1.852 | 0.801 | 1.891 |
+| Output arrangement | 2.658 | 1.649 | 2.459 |
+
+These are cumulative active times across 32 workers, not wall time;
+component medians need not sum to the pipeline median. Raw I reduces the
+busiest worker's Join activity from about 0.98s to 0.41s. Both optimized
+versions make the later Q rule-head dedup more expensive, by about 0.97
+and 1.08 active seconds respectively. Raw I's earlier join savings outweigh
+that cost; Normalized does not achieve the same critical-worker benefit.
+
+### Other profiling observations
+
+The same Raw I versus Normalized study found the following. These rows
+summarize its follow-up profiles and remeasurements, rather than new runs.
+
+| Case | Observation | Implication for layout assignment |
+|---|---|---|
+| Z3 | Total raw I falls from 173,537 to 155,929, but one 37.77-million-update consumer's arrangement activity rises from 7.443s to 9.703s. | A lower unit-weight total can hurt a high-volume edge. |
+| Andersen/medium | Large initial time regressions shrink to +0.68% / +0.84% on remeasurement; RSS still rises about 7%. Input maps become more expensive while downstream arrangements improve. | Include conversion costs and distinguish persistent effects from noisy timings. |
+| CRDT | The `value_blank_star` head rises from 1.953s to 2.052s of activity with unchanged record counts; its restoration map takes about 0.0716s. | A layout conversion can offset local sorting savings without adding another dedup. |
+| Dyck/kernel | Only two join orientations change; the target pipeline's activity is essentially unchanged. | A short wall-time difference alone does not establish a sorting benefit or regression. |
+| CSPA | Remeasurements are approximately tied. PostgreSQL's local head increase is mainly threshold activity; arrangement time and record counts barely change. | I omits batching and activation costs. |
+| CSDA/httpd | Raw I and Normalized have byte-identical binaries, yet timing differences between their labels change direction. | Label-to-label differences cannot establish a layout effect when the executable is identical. |
+
 ## Appendix B: Experimental context
 
 The Jython timing above comes from a 55-workload comparison of main
 [44ad2c5d][baseline] and the field-order experiment [d6ae8553][experiment]:
 five measured runs, medians, and 32 workers on one NUMA node. It measures
 whole-program execution, including assembly and loading, not compilation.
-Scallop and Z3 refer to earlier profiles. These timings are separate from
-the structural optimizer budgets above.
+The restored Scallop and rule-head Z3 examples use earlier field-order
+profiles. The Galen and other Raw-I observations come from the separate
+study based on main [5d345922][cost-baseline], comparing Raw I with
+$mI/I_{\max}$ normalization. Its original suite used five interleaved runs;
+follow-up cases used seven or fifteen runs. Profile activity is cumulative
+across 32 workers. Results from these studies are kept separate from the
+structural optimizer budgets above.
 
 Related documentation: [canonical form](canonical-form.md) and
 [mutability and deduplication](mutability.md).
