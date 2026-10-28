@@ -12,53 +12,8 @@ The design optimizes layouts for an existing join tree and sharing
 structure. It minimizes an additive layout cost, with every sorting
 boundary weighted equally. An optimal assignment means optimal under
 this cost model; actual runtime also depends on cardinality, skew,
-timestamps, and worker partitioning.
-
-## Motivating examples
-
-### Join output versus downstream arrangements
-
-The DOOP/Jython propagation rule is:
-
-```prolog
-VarPointsTo(heap,to) :- Assign(from,to), VarPointsTo(heap,from).
-```
-
-With `Assign` on the left, the nominal join order is:
-
-```text
-K=(from), LV=(to), RV=(heap)
-source: (from,to,heap)
-projected head: (heap,to)
-```
-
-A head layout `(to,heap)` better follows that traversal, but some consumers
-need heap-first arrangements. Swapping the join inputs changes the
-nominal source to `(from,heap,to)`. The optimizer must consider both
-upstreams, the head, and its consumers together.
-
-The rule-head field-order experiment in [PR #418][field-order-pr] reduced
-whole-program Jython time from about 315s to 214s. Other workloads exposed
-conflicts: Scallop's large seed favored a different layout from its joins,
-and Z3's locally attractive head layout made recursive block-key indexes
-more expensive. These motivate a global assignment rather than choosing
-one upstream's preferred order.
-
-`K ++ LV ++ RV` models local join traversal. Incremental history replay
-and output chunking do not guarantee that the complete stream has this
-order. The cost model uses it as a reference order.
-
-### Multiple producers must agree
-
-```prolog
-Out(c,a) :- R(a,b), S(b,c).
-Out(c,a) :- T(c,d), U(d,a).
-Out(c,a) :- Seed(c,a).
-```
-
-The first join favors `(a,c)` and the second favors `(c,a)`. Both and the
-seed feed one head layout. Each producer contributes an alignment cost;
-they cannot independently choose incompatible layouts for that head.
+timestamps, and worker partitioning. Workload examples are collected in
+[Appendix A](#appendix-a-case-studies).
 
 ## Transition cost: C[sigma_1 -> sigma_2]
 
@@ -152,6 +107,10 @@ The model preserves these constraints:
    required external schemas keep their semantics. Unsupported choices
    are excluded from the domains or assigned infinite cost.
 
+`K ++ LV ++ RV` models local join traversal. Incremental history replay
+and output chunking do not guarantee that the complete stream has this
+order. The cost model uses it as a reference order.
+
 For a join, a factor can depend on the common key order, both value
 orders, orientation, and target layout. A simplified view is:
 
@@ -165,6 +124,18 @@ The factor graph must be acyclic for tree DP. A dataflow DAG alone is
 insufficient: `Q -> A -> H` and `Q -> B -> H` couple the shared layouts
 of both `Q` and `H`, forming an undirected cycle. Likewise, an arrangement
 sharing tree does not automatically make the layout factor graph a tree.
+
+### Multiple producers must agree
+
+```prolog
+Out(c,a) :- R(a,b), S(b,c).
+Out(c,a) :- T(c,d), U(d,a).
+Out(c,a) :- Seed(c,a).
+```
+
+The first join favors `(a,c)` and the second favors `(c,a)`. Both and the
+seed feed one head layout. Each producer contributes an alignment cost;
+they cannot independently choose incompatible layouts for that head.
 
 ## DP on a forest
 
@@ -361,34 +332,6 @@ The [CSV](attribute-layout-cutset-costs.csv) contains both modes for all
 `max_component_outer` is the largest component product. Budgets enumerate
 independent components separately. Table sizes count states, not bytes.
 
-### Where the cost is concentrated
-
-CVC5 and Z3 have identical structure here. For either query:
-
-| Stratum | Fixed total | Free construction | Free DP | Free total | Free combined cut product |
-|---|---:|---:|---:|---:|---:|
-| 0 | 43,275,751 | 36,603,779 | 57,650,932 | 94,254,711 | 12 |
-| 1 | 7,612 | 4,628 | 4,240 | 8,868 | 4 |
-| 2 | 367,067 | 36,073 | 12,517,378 | 12,553,451 | 2,048 |
-| 3 | 20,594 | 16,272 | 6,068 | 22,340 | 2 |
-| 4 | 554 | 608 | 102 | 710 | 1 |
-| 5 | 3,162 | 2,134 | 1,360 | 3,494 | 4 |
-| 6 | 1,547,772 | 2,111,364 | 3,901,248 | 6,012,612 | 32 |
-
-Stratum 0 contributes **83.5%** of the free-orientation budget. Its largest
-factor has **2,073,600 states**, despite cut product 12. Small cuts reduce
-outer repetition but do not remove large local transitions.
-
-In stratum 2, the cut grows from six to eleven two-state variables:
-$64\to2{,}048$ assignments. Its budget grows from 367,067 to 12,553,451.
-Enumerating all five recursive IDB row layouts would instead require
-$3!\times4!\times3!\times4!\times5!=2{,}488{,}320$ assignments and
-still require checking remaining arrangement cycles.
-
-DOOP's final stratum has 147 variables and 137 factors, but cycle rank 4.
-A three-variable cut has combined product 8, largest component product 4,
-and budget 11,679. Its full query budget is 245,240.
-
 ## Implementation proposal
 
 Add a physical-layout pass in `flowlog-planner` after transformations and
@@ -421,7 +364,67 @@ existing join tree and runtime operator structure.
    Report cut products, proof status, table sizes, planning time, and any
    fallback that gives up exhaustive layout optimization.
 
-## Experimental context
+## Appendix A: Case studies
+
+### DOOP/Jython: head and downstream layouts
+
+The DOOP/Jython propagation rule is:
+
+```prolog
+VarPointsTo(heap,to) :- Assign(from,to), VarPointsTo(heap,from).
+```
+
+With `Assign` on the left, the nominal join order is:
+
+```text
+K=(from), LV=(to), RV=(heap)
+source: (from,to,heap)
+projected head: (heap,to)
+```
+
+A head layout `(to,heap)` better follows that traversal, but some consumers
+need heap-first arrangements. Swapping the join inputs changes the
+nominal source to `(from,heap,to)`. The optimizer must consider both
+upstreams, the head, and its consumers together.
+
+The rule-head field-order experiment in [PR #418][field-order-pr] reduced
+whole-program Jython time from about 315s to 214s. Other workloads exposed
+conflicts: Scallop's large seed favored a different layout from its joins,
+and Z3's locally attractive head layout made recursive block-key indexes
+more expensive. These motivate a global assignment rather than choosing
+one upstream's preferred order.
+
+### CVC5 and Z3: optimizer cost
+
+CVC5 and Z3 have identical structure here. For either query:
+
+| Stratum | Fixed total | Free construction | Free DP | Free total | Free combined cut product |
+|---|---:|---:|---:|---:|---:|
+| 0 | 43,275,751 | 36,603,779 | 57,650,932 | 94,254,711 | 12 |
+| 1 | 7,612 | 4,628 | 4,240 | 8,868 | 4 |
+| 2 | 367,067 | 36,073 | 12,517,378 | 12,553,451 | 2,048 |
+| 3 | 20,594 | 16,272 | 6,068 | 22,340 | 2 |
+| 4 | 554 | 608 | 102 | 710 | 1 |
+| 5 | 3,162 | 2,134 | 1,360 | 3,494 | 4 |
+| 6 | 1,547,772 | 2,111,364 | 3,901,248 | 6,012,612 | 32 |
+
+Stratum 0 contributes **83.5%** of the free-orientation budget. Its largest
+factor has **2,073,600 states**, despite cut product 12. Small cuts reduce
+outer repetition but do not remove large local transitions.
+
+In stratum 2, the cut grows from six to eleven two-state variables:
+$64\to2{,}048$ assignments. Its budget grows from 367,067 to 12,553,451.
+Enumerating all five recursive IDB row layouts would instead require
+$3!\times4!\times3!\times4!\times5!=2{,}488{,}320$ assignments and
+still require checking remaining arrangement cycles.
+
+### DOOP: a small cut in a large stratum
+
+DOOP's final stratum has 147 variables and 137 factors, but cycle rank 4.
+A three-variable cut has combined product 8, largest component product 4,
+and budget 11,679. Its full query budget is 245,240.
+
+## Appendix B: Experimental context
 
 The Jython timing above comes from a 55-workload comparison of main
 [44ad2c5d][baseline] and the field-order experiment [d6ae8553][experiment]:
