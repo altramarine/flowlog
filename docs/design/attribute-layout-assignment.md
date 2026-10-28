@@ -841,6 +841,13 @@ $D=k_{\mathrm{out}}!v_{\mathrm{out}}!$; a free projected row with $p$
 distinct fields has $D=p!$. The source width $m$ includes projected-away
 fields.
 
+The orientation factor of two is local to each join transition. It does
+not require an outer enumeration of all joins' orientation combinations.
+When orientation occurs in only one factor, minimize its two choices
+inside that factor before cut search. When several factors depend on the
+same orientation, keep their choice consistent; minimizing each factor's
+orientation independently would solve a different problem.
+
 When the raw-I block decomposition and independent child messages apply,
 the forward transition becomes
 
@@ -891,6 +898,142 @@ reduction only if a property of all incident factors and constraints
 proves that an optimum with that restriction exists. Merely observing
 no explicit precedence between two fields is insufficient. An unproved
 contraction is a restricted-domain heuristic and must be reported as such.
+
+### 7. Cutset and DP cost on benchmark plans
+
+The earlier analysis covered **16 query plans, 82 strata, and 55 datasets**
+from main at
+[`5d345922`](https://github.com/flowlog-rs/flowlog/commit/5d345922654a6ded5a296511a3d07d898a258adb).
+Multiple datasets of one query share the same layout problem, so work is
+counted once per query. The tables below give both the archived
+fixed-orientation counts and a recount allowing join-side swaps on those
+same plans.
+
+Both configurations use per-stratum field contraction, full-row
+intermediate-layout elimination, additive source-block factorization, and
+independent connected components. Each stratum's imported layouts are
+free. The free-orientation configuration adds a two-state variable for
+each modeled swappable join, shared by all factors depending on that
+join. Antijoins retain their required orientation.
+
+These are structural optimization budgets for the reduced per-stratum
+model, not runtime measurements or computed minimum values of $I$.
+The contraction and boundary assumptions are part of that model; the
+counts do not establish an unrestricted cross-stratum optimum.
+
+#### Counting convention
+
+Charge $m_f$ units per factor-table entry. For the residual DP, count state
+assignments visited by a selected variable-elimination order:
+
+$$
+\begin{aligned}
+B_H&=\sum_{f\in H}m_f\prod_{x\in X_f}d_x,\\
+P_H&=\prod_{x\in S_H}d_x,\\
+T_H^{\mathrm{VE}}&=
+\sum_{\text{elimination bags }b}\prod_{x\in b}d_x,\\
+W&=\sum_H\left[B_H+P_HT_H^{\mathrm{VE}}\right].
+\end{aligned}
+$$
+
+Each factor table is budgeted once. For each component, choose the
+smallest state budget among three elimination-order heuristics, after
+conditioning a minimum-product cut. A separate reconstruction of every
+elimination bag verifies the reported totals. All 82 fixed-orientation
+rows reproduce the archived analysis exactly.
+
+This preserves the earlier accounting convention. An elimination-bag
+assignment differs from a factor-table visit in the forest-message bound
+in section 6. Degree-based arithmetic, graph-search operations, scalar
+lookups, and outer minimum scans are excluded from this budget. Those
+last two counters are retained separately in the CSV.
+
+#### Results by query
+
+Both configurations have **62 strata already forming forests**, and all
+cut searches proved the minimum domain product for their fixed factor
+graphs. The largest independent-component cut product is **64** with
+fixed orientation and **2,048** with free orientation.
+
+The construction and repeated-DP columns below use free orientation;
+the fixed-total column reproduces the earlier result. The cut column is
+the largest product in an individual connected component, not a product
+across unrelated components.
+
+| Query | Datasets | Fixed total | Free construction | Free DP | Free total | Max free cut product |
+|---|---:|---:|---:|---:|---:|---:|
+| TC | 2 | 32 | 30 | 12 | 42 | 1 |
+| SG | 2 | 53 | 54 | 24 | 78 | 1 |
+| Reach | 4 | 11 | 11 | 4 | 15 | 1 |
+| CC | 3 | 26 | 26 | 10 | 36 | 1 |
+| SSSP | 2 | 33 | 27 | 6 | 33 | 1 |
+| Bipartite | 4 | 29 | 36 | 12 | 48 | 1 |
+| Dyck | 2 | 142 | 148 | 54 | 202 | 1 |
+| CRDT | 1 | 9,666 | 7,510 | 5,724 | 13,234 | 4 |
+| Galen | 1 | 2,388 | 1,280 | 3,458 | 4,738 | 16 |
+| Andersen | 2 | 86 | 90 | 36 | 126 | 1 |
+| Polonius | 4 | 3,602 | 2,222 | 4,378 | 6,600 | 16 |
+| CSPA | 3 | 178 | 176 | 62 | 238 | 2 |
+| CSDA | 3 | 32 | 30 | 12 | 42 | 1 |
+| CVC5 | 1 | 45,222,512 | 38,774,858 | 74,081,328 | 112,856,186 | 2,048 |
+| Z3 | 1 | 45,222,512 | 38,774,858 | 74,081,328 | 112,856,186 | 2,048 |
+| DOOP | 20 | 236,724 | 196,458 | 48,782 | 245,240 | 4 |
+| **Total** | **55** | **90,698,026** | **77,757,814** | **148,225,230** | **225,983,044** | **2,048** |
+
+The free-orientation budget is **225,983,044**, versus **90,698,026** with
+fixed orientation, or **2.49 times** the earlier budget. Trying two
+orientations doubles a local join trial. In this source-block factorization,
+the common orientation variable can also enlarge the cut product and
+repeated DP work; the complete budget is not obtained by doubling every
+entry in the old table. This is the cost of the stated factorization and
+cut-enumeration schedule, not a lower bound on every possible solver.
+
+The [per-stratum CSV](attribute-layout-cutset-costs.csv) contains all
+**164 stratum/configuration rows**, with `orientation-fixed` and
+`orientation-free` modes. `outer_product` is the combined product across
+all cut variables of a stratum; `max_component_outer` is the largest
+component product. `cached_budget` sums components independently.
+State-table sizes count entries, not bytes or process RSS.
+
+#### CVC5 and Z3
+
+These two queries have identical layout-problem structure in this
+analysis. For either query, the per-stratum budgets are:
+
+| Stratum | Fixed total | Free construction | Free DP | Free total | Free combined cut product |
+|---|---:|---:|---:|---:|---:|
+| 0 | 43,275,751 | 36,603,779 | 57,650,932 | 94,254,711 | 12 |
+| 1 | 7,612 | 4,628 | 4,240 | 8,868 | 4 |
+| 2 | 367,067 | 36,073 | 12,517,378 | 12,553,451 | 2,048 |
+| 3 | 20,594 | 16,272 | 6,068 | 22,340 | 2 |
+| 4 | 554 | 608 | 102 | 710 | 1 |
+| 5 | 3,162 | 2,134 | 1,360 | 3,494 | 4 |
+| 6 | 1,547,772 | 2,111,364 | 3,901,248 | 6,012,612 | 32 |
+
+In the free-orientation configuration, stratum 0 contributes about
+**83.5%** of each query's total budget. Its largest local factor contains
+**2,073,600 states**, despite its cut product being only 12. A small cut
+controls outer repetition; it does not remove large local transitions.
+
+Stratum 2 illustrates the orientation-related increase: its cut grows
+from six to eleven two-state variables, so the product grows from
+$2^6=64$ to $2^{11}=2{,}048$. Its cached budget grows from 367,067 to
+12,553,451. This is still much smaller than the outer enumeration of all
+five recursive IDB row layouts:
+
+$$
+3!\times4!\times3!\times4!\times5!=2{,}488{,}320.
+$$
+
+That IDB-only enumeration would also require checking for remaining
+arrangement coupling. Selecting a cut over physical layout variables
+avoids paying that full product.
+
+DOOP's final stratum has 147 nontrivial variables, including orientation,
+and 137 factors. Its cycle rank is 4. A three-variable cut has combined
+product 8, with largest independent component product 4; its budget is
+11,679. The full DOOP query totals 245,240. This shows why graph size
+alone is a poor estimate of cut-enumeration work.
 
 ## Implementation proposal
 
