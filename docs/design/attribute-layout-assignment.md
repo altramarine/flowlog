@@ -287,6 +287,720 @@ layouts through rule heads and recursion when possible. The user-written
 column order and `(key,left-value,right-value)` traversal model provide
 reference layouts, not a universal optimum.
 
+## Dynamic programming design
+
+The design below chooses layouts and physical left/right join orientation
+for an existing plan. The join tree, materializations, projections, and
+sharing decisions are inputs to this optimization. Changing join
+associativity or choosing new sharing parents is a separate search problem.
+
+The optimizer minimizes an additive layout cost. An exact solution means
+the minimum of that objective over all legal assignments in the modeled
+graph. It does not mean the minimum execution time on an unknown dataset.
+In particular, the nominal join traversal order described above is a
+modeling assumption, not a global ordering guarantee of Differential
+Dataflow's incremental join stream.
+The solver's table-memory budget below is also separate from the runtime
+memory budget in the broader problem statement.
+
+### 1. The cost abstraction: C[sigma_1 -> sigma_2]
+
+A layout is a lexicographic order of **attribute origins**. Origins identify
+fields through renaming and projection; two unrelated fields with the same
+name are not the same origin. At a sorting boundary, define
+
+$$
+C[\sigma_1 \to \sigma_2]
+$$
+
+as the estimated additional reordering work when records generated in
+source order $\sigma_1$ are consumed in target order $\sigma_2$. The target
+is expressed in source origins through the intervening field mappings.
+It may retain only a subset of the source fields.
+
+The abstraction separates the solver from the cost model:
+
+- A legal transition has a nonnegative cost. An illegal assignment has
+  cost $+\infty$, or is excluded from the state domain.
+- An unchanged comparator has zero additional reordering cost. This
+  excludes the fixed cost of scanning, hashing, and maintaining an index.
+- Each modeled sorting boundary contributes once. There is no separate
+  cost for a pure rename or projection with no sorting boundary.
+- Projection costs need not be symmetric. They describe the source
+  sequence before records with equal projected values are consolidated.
+
+The initial objective uses unit weights and no additional node cost:
+
+$$
+F(\ell)=\sum_{e\in E_{\mathrm{sort}}}
+C[\sigma_e(\ell)\to\tau_e(\ell)].
+$$
+
+Here $\ell$ is one assignment of all layout and join-orientation variables.
+The sum is over physical sorting boundaries, not arbitrary graph edges.
+Every consumer has its own contribution; a producer's cost is not divided
+by its number of consumers. Additional workload weights could be introduced
+later without changing the DP, but are not required by this design.
+
+#### A concrete instance: raw binary-record inversions
+
+One data-independent instance of $C$ is the raw inversion count $I$.
+For $m$ distinct source origins, assume all $2^m$ binary records occur
+once. Sort them lexicographically by $\sigma_1$, apply the field mapping,
+and count pairs whose order is reversed by the target comparator.
+Equal projected records do not form a strict inversion. Timestamps and
+update weights are outside this synthetic record model; the optimization
+does not remove them from runtime records.
+
+This counts **record inversions**, not inversions of the attribute
+permutation. It distinguishes changing an early comparison field from
+changing a late one:
+
+| Source | Target | Raw I |
+|---|---|---:|
+| `(a,b,c)` | `(b,a,c)` | 4 |
+| `(a,b,c)` | `(a,c,b)` | 2 |
+| `(c,a,b)` | `(a,b)` | 6 |
+| `(c,b,a)` | `(a,b)` | 8 |
+
+For full permutations of the same fields, let $P_\sigma(x)$ be the set
+of fields preceding $x$ in $\sigma$. Then
+
+$$
+I(\sigma,\tau)=
+\sum_{\substack{x<_\sigma y\\y<_\tau x}}
+2^{\,2m-|P_\sigma(x)\cup P_\tau(y)|-4}.
+$$
+
+Each term counts record pairs whose first unequal source field is $x$
+and first unequal target field is $y$. These classes are disjoint. Thus
+the score can be computed without enumerating the binary records.
+A direct implementation of this formula visits $O(m^2)$ field pairs.
+The DP below treats the evaluation cost as a parameter rather than
+assuming a particular implementation of $I$.
+
+Raw $I$ is a sorting surrogate. It is not the comparison count of the
+runtime sorter, the cost of trace merging, or a prediction of parallel
+wall-clock time. The binary model is rebuilt at each modeled boundary;
+it does not propagate real cardinalities or correlations through joins.
+
+#### Projection keeps a virtual suffix
+
+Let $\tau$ list the retained fields, and let $D$ list dropped fields in
+their source-relative order. For the raw-I instance, define
+
+$$
+C[\sigma\to\tau]=I(\sigma,\tau\mathbin\Vert D).
+$$
+
+The suffix is only a device for scoring. It does not become part of the
+physical row, arrangement value, or dedup identity. If two records differ
+on retained fields, their order is decided before the suffix. If they
+agree on retained fields, the suffix preserves their source order and
+introduces no extra inversion.
+
+For example:
+
+```text
+feed:                 (a,b,c,d,e)
+retained comparator:  (c,d,e)
+comparison for C:     (a,b,c,d,e) -> (c,d,e,a,b)
+```
+
+Consecutive pure projections compose before scoring:
+
+```text
+(a,b,c) -> (b,c) -> (c) -> arrangement
+one cost: (a,b,c) -> (c,a,b)
+```
+
+A real intervening arrangement or dedup is a new boundary and prevents
+this composition. Its downstream model starts from the fields that
+actually survive that boundary; discarded fields do not reappear.
+
+For the earlier two-input example:
+
+```text
+R: K=(k), V=(a,b)
+S: K=(k), V=(c,d)
+nominal join source: (k,a,b,c,d)
+downstream arrangement: K=(b,d), V=(a,c)
+comparison for C: (k,a,b,c,d) -> (b,d,a,c,k)
+```
+
+Here the conceptual trailing block `V'=(k)` is a virtual suffix. The
+legal target keeps all of `K` before all of `V`, with permutations allowed
+inside each block. No runtime index retains `k` merely for this score.
+
+### 2. A graph of variables and factors
+
+Represent the assignment problem as a finite **factor graph**. It is a
+bipartite, undirected graph: variable nodes hold layout choices, and factor
+nodes assign costs or enforce compatibility between those choices.
+Dataflow direction remains metadata used to interpret each factor.
+
+For each physical representation, introduce permutation variables for its
+key and value blocks. A block of $b$ unconstrained fields has $b!$ states.
+An arrangement with key width $k$ and value width $v$ therefore has
+$k!v!$ legal layouts, rather than $(k+v)!$. A full-row representation
+has $m!$ states unless further constraints apply.
+
+The variables can remain split into blocks, which often produces smaller
+factor scopes. The domain size of variable $x$ is denoted $d_x$.
+Singleton domains can be substituted immediately.
+
+The graph must express the following identities and choices:
+
+- The two inputs of a join share the same key-permutation variable after
+  their equal attributes are mapped to common origins.
+- A legal inner join has an orientation variable with at most two states.
+  Its nominal source is `K ++ LV ++ RV` or `K ++ RV ++ LV`. Asymmetric
+  operators, such as antijoins, keep their required semantic orientation.
+- All producers of one union/head agree on its physical layout. Each
+  producer has a factor mapping its own origins to that shared layout.
+- Recursive feedback reuses the same representation variables. Iterations
+  are not unrolled into new optimization variables.
+- Two different arrangements of a relation have distinct layout variables,
+  even if their field sets happen to agree. Only an actually shared trace
+  shares a physical-layout decision.
+- External schemas, key membership, and unsupported transformations impose
+  domain restrictions or compatibility factors.
+
+A sorting factor $f_e$ depends on every variable needed to determine
+$\sigma_e$ and $\tau_e$. Its value is their transition cost. A join can
+therefore induce a factor involving both input value permutations, the
+shared key permutation, orientation, and the target layout. It cannot in
+general be replaced by two independently minimized input costs.
+
+For a simplified join with layout variables $a,b,c$:
+
+```text
+dataflow:       A join B -> C
+
+factor graph:  [a] ---- (join factor) ---- [c]
+                             |
+                            [b]
+```
+
+Square brackets denote variables and parentheses denote factors. A factor
+can have more than two neighbors; such a star is still a tree.
+
+A shared producer may create a cycle even when the dataflow is a DAG:
+
+```text
+dataflow:       Q -> A -> H
+                \-> B -> H
+
+factor graph:  [q] -- (fQA) -- [a] -- (fAH) -- [h]
+                |                              |
+               (fQB) -------- [b] ----------- (fBH)
+```
+
+The layout of `q` and the layout of `h` must each be chosen consistently
+for both branches. Solving the branches independently loses that coupling.
+Consequently, breaking directed recursion alone is insufficient: the DP
+needs an **undirected factor-graph forest** after conditioning.
+
+Sharing topology is fixed here. A tree of arrangement-sharing parents is
+not automatically a forest in this graph, and the DP does not select
+sharing parents unless those choices are explicitly added to the model.
+
+### 3. Exact DP on a forest
+
+For a variable $x$ and adjacent factor $f$, let $M_{x\to f}(s)$ be the
+minimum cost on the $x$ side of that edge when $x=s$. Let $N(x)$ and
+$N(f)$ denote neighbors. With unary restrictions $u_x$, zero for a legal
+state unless a separate unary cost is explicitly modeled:
+
+$$
+M_{x\to f}(s)=u_x(s)+
+\sum_{g\in N(x)\setminus\{f\}}M_{g\to x}(s).
+$$
+
+A factor sends a message by minimizing over all its other variables:
+
+$$
+M_{f\to x}(s)=
+\min_{\{s_y:y\in N(f)\setminus\{x\}\}}
+\left[
+f(s,\{s_y\})+
+\sum_{y\in N(f)\setminus\{x\}}M_{y\to f}(s_y)
+\right].
+$$
+
+Choose any variable as a root in each component. Evaluate messages from
+leaves toward that root. The component optimum is
+
+$$
+\min_s\left[u_r(s)+\sum_{f\in N(r)}M_{f\to r}(s)\right].
+$$
+
+Store minimizing choices and backtrack from the winning root state to
+recover one consistent layout and orientation assignment. Independent
+components contribute a sum of optima. A second message pass is useful
+when all conditional optima are wanted, but is unnecessary to recover
+one optimal assignment.
+
+#### Transitions can run against dataflow
+
+For `A join B -> C`, root the factor tree at `A` if convenient. The message
+to `A` is
+
+$$
+M_{J\to A}(a)=\min_{b,c,o}
+\left[J(a,b,c,o)+M_{B\to J}(b)+M_{C\to J}(c)+M_{o\to J}(o)\right].
+$$
+
+The message from `C` includes its downstream costs. This transition
+jointly chooses `B`, `C`, and orientation; it does not freeze `C` at the
+locally cheapest layout. The same factor sends a message to `C` by
+minimizing over `A`, `B`, and orientation. Reversing the message direction
+does not reverse the physical operator or replace $C[\sigma\to\tau]$
+by $C[\tau\to\sigma]$.
+
+For an unshared join tree, the familiar forward recurrence is a special
+case. Write $q,p,t$ for key, left-value, and right-value permutations:
+
+$$
+F_C(\tau)=\min_{q,p,t,o}
+\left[F_A(q,p)+F_B(q,t)+
+C[q\Vert V_o(p,t)\to\tau]\right],
+$$
+
+where $V_0(p,t)=p\Vert t$ and $V_1(p,t)=t\Vert p$.
+Both inputs use the same $q$. For projected output, the cost applies the
+virtual-suffix rule above.
+
+A union whose producer subtrees are independent has the recurrence
+
+$$
+F_H(\tau)=\sum_i\min_{\sigma_i}
+\left[F_i(\sigma_i)+C[\sigma_i\to\tau]\right].
+$$
+
+Every term uses the same $\tau$. This is a sum of alignment contributions
+to one head, not a proposal to insert a separate runtime dedup per producer.
+If producer subtrees share variables, use the complete factor graph rather
+than adding overlapping subtree costs.
+
+The forest recurrence is exact because removing an edge separates the
+remaining variables into independent subproblems conditional on its
+boundary variable. Each factor is charged once, and every legal state on
+that boundary is considered. This conditional independence is the reason
+the algorithm works; dataflow acyclicity by itself does not supply it.
+
+### 4. Exact reductions and transition optimizations
+
+These transformations reduce optimization work. They do not require
+changing the runtime operator structure.
+
+#### Compose maps, share identities, and remove fixed states
+
+Compose consecutive pure field mappings before extracting sorting factors.
+Represent a shared join-key order by one variable rather than an equality
+table over two copies. Substitute singleton or externally pinned states,
+drop genuinely unused variables, and solve disconnected components
+separately. Keep each nonconstant factor and its cost exactly once.
+
+#### Eliminate unrestricted intermediate full-row layouts
+
+For raw $I$ on the same complete field set, the record-order inversion
+distance obeys the triangle inequality. If an intermediate $\zeta$ has
+only two incident costs, may choose every permutation, and has no other
+constraint or consumer, then
+
+$$
+\min_\zeta\left[I(\sigma,\zeta)+I(\zeta,\tau)\right]
+=I(\sigma,\tau).
+$$
+
+Choosing $\zeta=\tau$ attains the bound. This removes a search variable;
+its layout can be recovered afterward. The identity requires the same
+field set and compatible cost scales. It does not justify eliminating an
+arbitrary projected, pinned, or shared intermediate representation.
+
+#### Separate source blocks when the cost permits it
+
+Raw binary-record $I$ has an additional property. For a fixed target and
+fixed block order, the effects of internal permutations of disjoint
+source blocks are additive. For a join, this gives
+
+$$
+I(q\Vert p\Vert t,\tau)=
+c(\tau)+g_K(q,\tau)+g_L(p,\tau)+g_R(t,\tau).
+$$
+
+To see why, partition record pairs by the first **source block** on which
+they differ. Their source comparison depends only on the permutation in
+that block. Fixing the target comparator leaves the permutations of other
+blocks irrelevant to that class. The argument also holds for strict
+comparison after projection.
+
+One construction uses a reference permutation for every block. Let $c$
+be the reference cost and let $g_B$ be the change from permuting only block
+$B$. These differences can be negative; their sum with $c$ is the original
+nonnegative cost. A source block discarded in its entirety has no internal
+permutation effect and can be removed from that factor's scope.
+
+For a fixed shared key permutation $q$, target $\tau$, and orientation,
+an independent two-child tree transition can therefore minimize the left
+and right value permutations separately:
+
+$$
+\begin{aligned}
+F_C(\tau)=\min_{q,o}\bigl[&c(q,o,\tau)\\
+ &+\min_p\{F_A(q,p)+g_L(p,q,o,\tau)\}\\
+ &+\min_t\{F_B(q,t)+g_R(t,q,o,\tau)\}\bigr].
+\end{aligned}
+$$
+
+This changes a product of the two value-domain sizes into a sum for that
+transition. In the general graph, preserve the shared target, key, and
+orientation variables in the smaller factors. It is not valid to minimize
+each consumer independently or to assume the decomposition for an
+arbitrary replacement cost model.
+
+#### Cache local tables and conditional messages
+
+A factor depends only on its scope. Cache its cost table once when it is
+small enough, and reuse it across cut assignments. A conditioned message
+need only be recomputed when cut variables in its dependency set change.
+Keep those variables as message parameters when their combined domain
+fits the memory budget. This trades larger tables for fewer repeated DPs.
+
+#### Optional raw-I distance transform
+
+For full permutations of $m$ binary fields, swapping adjacent attribute
+positions $i,i+1$, counted from zero, has record-inversion cost
+
+$$
+w_i=2^{2m-i-4}.
+$$
+
+The shortest-path distance on this weighted permutation graph is exactly
+full-field $I$. Record-order Kendall distance gives the lower bound.
+Moving each next target field left into its target-prefix position fixes
+only record pairs that disagree with the final target order, attaining
+that bound.
+
+Consequently, a transition of the form
+
+$$
+F(\tau)=\min_\sigma\{G(\sigma)+I(\sigma,\tau)\}
+$$
+
+can use a multi-source shortest-path transform over $m!$ permutations.
+Initialize legal source states with $G$ and read out legal target states.
+Intermediate permutation-graph states are calculation states, not new
+physical layouts, so they need not satisfy arrangement K/V constraints.
+
+For a projected target, read out the minimum over all completions
+$\tau\Vert\delta$ of its dropped fields. For each source, its own
+source-relative dropped suffix attains the projected cost; another suffix
+can only add inversions between equal projected records. This makes the
+transform exact for the projection convention as well.
+
+The transform can avoid a dense source-by-target table. It does not
+remove graph cycles or separator variables. It is an optional cost-specific
+optimization; the generic forest DP does not depend on it.
+
+### 5. Find a cutset, then enumerate its assignments
+
+When the factor graph contains undirected cycles, choose a set $S$ of
+**variable nodes** such that deleting those nodes and their incident
+edges leaves a forest. This is a cycle cutset, not a set of discarded
+operators or costs.
+
+For every assignment $s$ to $S$, substitute its states in all factors.
+A factor with no remaining variables becomes a scalar cost and is still
+included. Run the forest DP on the remaining graph and take
+
+$$
+\operatorname{OPT}=\min_{s\in\prod_{x\in S}\mathcal L_x}
+\operatorname{ForestOPT}(s).
+$$
+
+Every complete assignment has exactly one restriction to $S$, so exhaustive
+cut enumeration plus exact forest DP gives an exact solution of the
+original finite model. The cut need not be minimum for this guarantee.
+Choosing a smaller cut makes solving cheaper; it does not improve the
+best attainable objective value.
+
+The number of outer assignments is
+
+$$
+P(S)=\prod_{x\in S}d_x.
+$$
+
+Prefer a cut with small domain product, equivalently small
+$\sum_{x\in S}\log d_x$, rather than few variables. A two-state key
+permutation and a 720-state full-row permutation have very different
+enumeration costs. The cut may contain key, value, full-row, or orientation
+variables. Fixing a logical IDB's row order does not also fix all its
+different arrangements.
+
+#### A feasible greedy cut
+
+Let $\beta=|E|-|V|+\text{components}$ be the cycle rank of the current
+undirected incidence graph. While $\beta>0$, choose a variable whose
+deletion reduces $\beta$, favoring a large reduction per $\log d_x$ paid.
+Afterward, remove redundant cut variables whenever the residual graph
+remains a forest. This gives a feasible incumbent without a claim of an
+approximation ratio.
+
+#### Exact branch and bound
+
+To improve or certify that incumbent:
+
+1. Find a cycle in the remaining incidence graph.
+2. Branch on selecting each variable node on that cycle. Every valid
+   completion must select at least one of them.
+3. Multiply the current domain product by the selected variable's domain.
+   Prune when a lower bound cannot beat the incumbent product.
+4. If there is no cycle, record the feasible cut.
+
+A lower bound comes from a collection of cycles with disjoint variable
+sets: multiply the smallest domain size on each cycle. A cut must pay for
+at least one distinct variable per such cycle. Memoizing selected-variable
+sets avoids visiting the same subproblem through different branch orders.
+
+Keep factor identities fixed during this search. In particular, do not
+dynamically merge equal or contained scopes after conditioning and then
+use an old cycle as a branching certificate: changing the graph can
+invalidate the argument that the selected cycle must be hit. Exact factor
+simplifications may be done before search; verify the forest condition on
+the resulting fixed graph.
+
+An exhausted search proves minimum $P(S)$ for this fixed factorization and
+choice of variable domains. A bounded search may return an uncertified but
+valid cut; exhaustive assignment enumeration over that cut still yields
+the optimal layout. Stopping the **layout enumeration** early is different
+and forfeits that guarantee.
+
+The smallest domain product need not minimize total solver work. Compare
+candidate cuts using their residual transition sizes and peak tables as
+well. A larger cut may shrink expensive factors enough to be preferable.
+
+### 6. Complexity and the scope of optimality
+
+Let $X_f$ be the variables in factor $f$, $r_f=|X_f|$, and
+$A_f=\prod_{x\in X_f}d_x$. Let $\kappa_f$ be the work needed to evaluate
+one entry of its cost table. A direct dense construction costs
+
+$$
+B=O\left(\sum_f\kappa_f A_f\right).
+$$
+
+For a fixed cut $S$, put $A_f(S)=\prod_{x\in X_f\setminus S}d_x$.
+With cached factor values, one inward forest pass has the bound
+
+$$
+T(S)=O\left(
+\sum_f\max(1,r_f)A_f(S)+
+\sum_{x\notin S}\deg(x)d_x
+\right).
+$$
+
+The factor term includes scanning state combinations and adding incoming
+messages; it also includes scalar factors. Variable messages sum incoming
+tables. With $Q_{\mathrm{cut}}$ graph-search work, the uncached-message
+outer scheme has the bound
+
+$$
+O\left(Q_{\mathrm{cut}}+B+P(S)T(S)\right).
+$$
+
+If full tables are too large, evaluate entries on demand; then their
+evaluation cost reappears in the repeated DP term. Dense factor storage
+is $O(\sum_f A_f)$, with additional message tables and backpointers.
+Cut assignments can be processed one at a time. A small cut product does
+not by itself bound the largest local table or total memory use.
+
+Disconnected components must be counted separately:
+
+$$
+\sum_H\left[B_H+P(S_H)T_H(S_H)\right],
+$$
+
+plus cut-search work. Multiplying cut domains from unrelated components
+creates avoidable repeated work.
+
+#### Factorials in a join transition
+
+For a join with $k$ key fields, $l$ left-value fields, and $r$ right-value
+fields, there are at most $2k!l!r!$ nominal source layouts, including
+orientation. If its target has $D$ legal layouts, direct forward
+enumeration needs
+
+$$
+O\left(\kappa(m)Dk!l!r!\right),\qquad m=k+l+r,
+$$
+
+with the factor of two suppressed. A target arrangement has
+$D=k_{\mathrm{out}}!v_{\mathrm{out}}!$; a free projected row with $p$
+distinct fields has $D=p!$. The source width $m$ includes projected-away
+fields.
+
+When the raw-I block decomposition and independent child messages apply,
+the forward transition becomes
+
+$$
+O\left(\kappa(m)Dk!(l!+r!)\right).
+$$
+
+In a budget charging $m$ units per cost evaluation, this is the shorthand
+$mDk!(l!+r!)$. That accounting convention must be distinguished from the
+actual complexity of the chosen cost oracle. Reverse messages and factors
+with other shared interfaces are budgeted from their actual scopes;
+the forward formula is not a universal bound on every graph transition.
+
+The optional distance transform instead has $m!$ states and
+$(m-1)m!$ directed neighbor relaxations. With a binary heap, its bound is
+$O(mm!\log(m!))$ plus seeding, target readout, and permutation-indexing
+work. Distances need $O(m!)$ entries; edges need not be materialized.
+For distinct retained fields, enumerating all dropped-suffix completions
+across legal target prefixes visits at most $m!$ states. This is useful
+only when that full-origin permutation space fits the budget.
+
+#### Cut search and strata
+
+Finding a minimum-product cut is itself an exponential search in the
+worst case. Memoized exhaustive search has at most $2^n$ selected-variable
+subsets for $n$ candidate variables, with polynomial graph work per state.
+A greedy incumbent and lower bounds reduce practical work but give no
+polynomial worst-case guarantee. Apply a graph-search budget separately
+from the budget for enumerating layout states.
+
+A coarse alternative fixes every recursive IDB row layout, incurring a
+factor $\prod_R \operatorname{arity}(R)!$. It can be much larger than a
+cut over a few two-state physical block variables, and may still leave
+undirected cycles involving arrangements or reconverging consumers.
+Validate the forest condition rather than assuming IDB enumeration is
+sufficient.
+
+Per-stratum optimization is exact **conditional on its boundary layouts**.
+Freezing imported/exported layouts while solving strata in some order is
+a coordination heuristic. For a global guarantee, either solve the graph
+including cross-stratum boundary variables or pass exact cost messages
+over their joint assignments. A multi-variable boundary can require a
+product-sized separator table. Neither reverse stratum order nor a
+particular root choice removes this coupling.
+
+Likewise, forcing a group of attributes to stay consecutive is an exact
+reduction only if a property of all incident factors and constraints
+proves that an optimum with that restriction exists. Merely observing
+no explicit precedence between two fields is insufficient. An unproved
+contraction is a restricted-domain heuristic and must be reported as such.
+
+## Implementation proposal
+
+This section proposes an implementation; the preceding sections define
+the algorithm independently of compiler data structures.
+
+### Placement and representation
+
+Add a physical-layout planning pass in `flowlog-planner`, after the
+existing transformations and actual sharing identities are available and
+before `flowlog-codegen` emits tuple accesses. Keep the existing join tree
+and operator structure. The initial pass should choose layouts and legal
+join orientations without inserting or deleting runtime dedups or
+arrangements.
+
+Introduce a proposed `PhysicalLayoutPlan` carrying the selected field
+permutations, join orientations, and conversions for each physical
+representation. Keep logical attribute identity separate from physical
+tuple position. A representation identity must include its scope and
+actual sharing identity; a relation name alone cannot identify a trace.
+Recursive feedback within a stratum and a completed relation exposed to a
+later stratum must remain distinct where the current planner distinguishes
+them. See [the scope of canonical sharing](canonical-form.md#scope-the-one-assumption-a-caller-can-break).
+
+Extract a solver model with these records:
+
+- Layout variables with legal permutation domains and any pinned states.
+- Join metadata with common key origins, input value origins, and legal
+  orientations.
+- Sorting factors with stable identities, variable scopes, and composed
+  source-to-target origin mappings, including dropped origins for scoring.
+- Representation and boundary mappings that let a winning assignment be
+  translated back into the existing plan.
+
+Do not identify arrangements solely because their canonical logical rows
+agree. Their physical key membership, layout, scope, and runtime sharing
+must also be compatible. If applying a layout changes representation
+fingerprints, regenerate dependent references consistently or retain a
+separate physical identity layer.
+
+### Solver components
+
+Separate graph extraction, cost evaluation, cut selection, forest solving,
+and plan application. A practical implementation sequence is:
+
+1. Implement the generic finite-domain factor model and raw-I oracle,
+   including projection completion and composed mappings. Retain a direct
+   evaluator as the reference for optimized cost calculations.
+2. Implement exact forest messages with backpointers. Test every rooting
+   direction of a binary join, not only forward transitions.
+3. Add singleton substitution, shared-key aliases, independent components,
+   and the proven full-row and source-block reductions. Validate that
+   their reconstructed assignments reproduce the unreduced objective.
+4. Add greedy cut selection and bounded branch and bound, retaining a
+   verified feasible cut at all times. Report whether minimum cut product
+   was proved independently of whether layout enumeration was exhaustive.
+5. Cache local tables subject to explicit entry and byte budgets. Cache
+   conditional messages by the cut variables they actually depend on.
+   Consider the distance transform only after the generic solver is
+   validated and dense transitions are shown to dominate planning work.
+
+Use deterministic state ordering and prefer the existing main layout and
+orientation among equal-score solutions. Cost arithmetic must be exact
+over supported widths and sums, including negative reference-difference
+factors; detect unsupported ranges rather than silently wrapping or
+conflating overflow with a legal score.
+
+Initially, a per-stratum deployment can pin already established boundary
+layouts and clearly report conditional optimality. A later global mode
+can retain boundary variables and their separator messages. Do not label
+the former globally optimal or treat a frozen interface as if it had been
+minimized jointly with its consumers.
+
+### Applying and validating the result
+
+Have code generation consume the selected physical plan when constructing
+arrangement tuples, join key/value accesses, projections, head unions,
+and feedback bindings. Rewrite all contributors to a shared head into the
+same selected physical schema. Restore required external argument order
+at input/output boundaries. Preserve set membership, signed updates,
+aggregate semantics, and timestamp handling.
+
+The first implementation should keep opaque computed expressions and
+operators without an established layout contract at their existing legal
+layout. Aggregate grouping inputs can use the composed projection of
+their non-aggregate fields for alignment; aggregate payloads and result
+fields need their own origin and ordering contract before they become
+free variables.
+
+Validate the optimizer at three levels:
+
+- Compare raw-I formulas with explicit binary-record enumeration, including
+  empty and partial projections, renamed fields, repeated references, and
+  composed projection chains. Constants do not affect a comparator;
+  repeated origins use their first effective comparison position.
+- On small complete models, compare forest DP and cut-conditioned DP with
+  exhaustive assignments. Include reverse join messages, both join
+  orientations, multiple head producers, reconverging branches, separate
+  arrangements of one relation, and recursive boundary variables.
+- Run the repository's correctness suites, then compare generated physical
+  plans and performance against the same main revision. Recompute the
+  full unreduced objective from the applied layout, and verify every
+  shared key, mapping, and external schema before benchmarking.
+
+Expose planning diagnostics: state-domain sizes, graph components, cut
+variables and domain product, cut-search proof status, factor/message
+entries, cost-evaluation counts, planning time, and the selected objective.
+If a solver budget forces a heuristic fallback, preserve a complete legal
+assignment and report the loss of the layout-optimality guarantee.
+
 ## Experimental context
 
 The motivating full-suite comparison used main at [44ad2c5d][baseline]
