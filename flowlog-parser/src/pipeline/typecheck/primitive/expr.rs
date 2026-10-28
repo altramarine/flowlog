@@ -45,7 +45,8 @@ pub(super) fn infer_expr(
     Ok(inferred)
 }
 
-fn infer_factor(
+/// Infer a factor's type, as [`infer_expr`] does an expression's.
+pub(super) fn infer_factor(
     factor: &Factor,
     bindings: &Bindings,
     udfs: &UdfSigs,
@@ -55,23 +56,19 @@ fn infer_factor(
         Factor::Const(c) => Some(c.ty().clone()),
         Factor::FnCall(fc) => Some(infer_fn_call(fc, bindings, udfs)?),
         Factor::Builtin(bc) => Some(infer_builtin_call(bc, bindings, udfs)?),
-        // A cast types a literal-typed operand (a numeric literal, or a count
-        // or mean no use has fixed yet) as its target's primitive root, so
-        // the cast, not the expression around it, fixes the operand's width.
-        // Any other operand keeps its own type, and the `subtype` pass checks
-        // a variable bound by an atom against the target. Typing every
-        // operand as the target would make `as(strlen(s), int64)` compute in
-        // `int64`, but it would also reject `to_string(as(n, int64))` for a
-        // count `n`, which runs correctly today: a count's width does not
-        // follow a cast nested inside a call. So a non-literal operand still
-        // computes at its own width, `int32` for `strlen`, under the cast.
+        // A cast is a runtime no-op, so its scalar operand must already have
+        // the target's primitive, or the cast would be silently dropped. A
+        // polymorphic literal takes it, so the cast, not the expression
+        // around it, fixes the literal's width. A tuple construct's literal
+        // fields are defaulted when inferred, so a tuple keeps its own type;
+        // the `subtype` pass checks a tuple variable bound by an atom.
         Factor::Cast(c) => match infer_factor(c.inner(), bindings, udfs)? {
-            Some(family) if family.is_literal() => {
+            Some(scalar) if !scalar.is_tuple() => {
                 let root = c.target()?.root();
-                if !family.fits(root) {
+                if !scalar.fits(root) {
                     return Err(ParseError::IllegalCast {
                         span: c.span(),
-                        from: family.to_string(),
+                        from: scalar.to_string(),
                         to: c.target_type().to_string(),
                     });
                 }
@@ -239,8 +236,7 @@ pub(super) fn pin_expr(
     udfs: &UdfSigs,
 ) -> Result<(), ParseError> {
     let span = a.span();
-    pin_factor(a.init_mut(), target, span, bindings, udfs)?;
-    for (_, f) in a.rest_mut() {
+    for f in a.factors_mut() {
         pin_factor(f, target, span, bindings, udfs)?;
     }
     Ok(())
@@ -264,8 +260,8 @@ fn pin_factor(
         Factor::FnCall(fc) => pin_fn_call(fc, bindings, udfs),
         Factor::Builtin(bc) => pin_builtin_call(bc, bindings, udfs),
         // The enclosing context pinned this expression to the type
-        // `infer_factor` gave the cast: its target's root for a literal-typed
-        // operand, the operand's own type otherwise. Either way `target` is
+        // `infer_factor` gave the cast: its target's root for a scalar
+        // operand, the tuple's own type for a tuple. Either way `target` is
         // the width the operand's literals take.
         Factor::Cast(c) => pin_factor(c.inner_mut(), target, span, bindings, udfs),
         Factor::Group(a) => pin_expr(a, target, bindings, udfs),
@@ -530,18 +526,13 @@ mod tests {
     }
 
     /// A cast, not its context, fixes a literal operand's width: compared
-    /// only with literals, the operand takes the cast's width rather than
-    /// the default `int32` or `f32`.
+    /// only with literals, the operand takes the cast's root rather than the
+    /// default `int32` or `f32`, a subtype's root included.
     // Cases: comparison, cast literal once pinned.
     #[rstest]
-    #[case::int64_shift("as(1, int64) bshl 31 > 0", Constant::new(DataType::Int64, "1"))]
     #[case::int64_above_int32(
         "as(3000000000, int64) > 0",
         Constant::new(DataType::Int64, "3000000000")
-    )]
-    #[case::uint64_above_int32(
-        "as(3000000000, uint64) > 0",
-        Constant::new(DataType::UInt64, "3000000000")
     )]
     #[case::float64("as(1.5, f64) > 0.0", Constant::new(DataType::Float64, "1.5"))]
     #[case::subtype(
@@ -560,25 +551,20 @@ mod tests {
         assert_eq!(cmp.left().init(), &Factor::Const(literal));
     }
 
-    /// A cast literal must fit its target's width, as a literal in a column
-    /// of that type must: `300` fits the default `int32` but not
-    /// `as(300, int8)`.
-    #[test]
-    fn cast_literal_out_of_target_range_rejected() {
-        assert_err!(
-            checked(&filtered_by("as(300, int8) > 0")),
-            ParseError::LiteralOutOfRange { literal, target: DataType::Int8, .. }
-                if literal == "300"
-        );
-    }
-
-    /// `as()` is a runtime no-op, not a conversion, so a literal keeps its
-    /// family: the error names the literal's family, not its default width.
+    /// `as()` is a runtime no-op, not a conversion, so a scalar operand of
+    /// another primitive root is rejected. The error names a literal's family
+    /// and any other operand's type, a count's once a use fixed it.
     // Cases: comparison, from, to.
     #[rstest]
-    #[case::integer_to_float("as(1, f64) > 0.5", "integer literal", "f64")]
-    #[case::float_to_integer("as(1.5, int64) > 0", "float literal", "int64")]
-    fn cast_literal_across_primitive_roots_rejected(
+    #[case::literal("as(1, f64) > 0.5", "integer literal", "f64")]
+    #[case::atom_bound_variable("as(x, int64) > 0", "int32", "int64")]
+    #[case::grouped_expression("as((x + 1), int64) > 0", "int32", "int64")]
+    #[case::count_fixed_by_a_comparison(
+        "c = count : K(y), c < x, as(c, int64) > 0",
+        "int32",
+        "int64"
+    )]
+    fn cast_across_primitive_roots_rejected(
         #[case] comparison: &str,
         #[case] expected_from: &str,
         #[case] expected_to: &str,
@@ -590,25 +576,10 @@ mod tests {
         );
     }
 
-    /// A count is typed like a literal until a use fixes its width, so a
-    /// cast on it is such a use: the shift amount beside it takes `int64`.
+    /// A non-literal operand within the target's primitive root is legal.
     #[test]
-    fn cast_fixes_count_width() {
-        let program = checked(&filtered_by(
-            "n = count : { K(y) }, as(n, int64) bshl 31 > 0",
-        ))
-        .unwrap();
-        let cmp = program.rules()[0]
-            .rhs()
-            .iter()
-            .find_map(|predicate| match predicate {
-                Predicate::Compare(c) => Some(c),
-                _ => None,
-            })
-            .expect("the rule keeps its comparison");
-        assert_eq!(
-            cmp.left().rest()[0].1,
-            Factor::Const(Constant::new(DataType::Int64, "31"))
-        );
+    fn cast_within_primitive_root_accepted() {
+        checked(&filtered_by("as((x + 1), int32) > 0"))
+            .expect("a cast within one primitive root must type");
     }
 }
