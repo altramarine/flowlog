@@ -153,10 +153,11 @@ impl StratumPlanner {
     /// the same body have the same mutability, so a server never changes
     /// what a reader receives (see `docs/design/mutability.md`).
     ///
-    /// A keyed output is the shape a join reads. A server whose joins are
-    /// all served here is read by maps alone afterwards, so it is held as
-    /// rows before the maps over it are built, and a served member whose
-    /// form then equals its server's is aliased to it rather than mapped.
+    /// A keyed output is the shape a join or an aggregate reads. A server
+    /// whose joins and aggregates are all served here is read by maps
+    /// alone afterwards, so it is held as rows before the maps over it are
+    /// built, and a served member whose form then equals its server's is
+    /// aliased to it rather than mapped.
     ///
     /// # Errors
     ///
@@ -207,8 +208,8 @@ impl StratumPlanner {
                 }
             }
 
-            // A server no join reads any more is held as rows before the
-            // maps over it are built, so their flows read rows.
+            // A server no join or aggregate reads any more is held as rows
+            // before the maps over it are built, so their flows read rows.
             for &member in &cover.computed {
                 let Some(index) = own(member) else {
                     continue;
@@ -222,19 +223,22 @@ impl StratumPlanner {
                     .map_or(&[][..], Vec::as_slice);
                 if remaining
                     .iter()
-                    .any(|&reader| !self.transformations[reader].is_unary())
+                    .any(|&reader| !self.transformations[reader].is_map())
                 {
                     continue;
                 }
                 if let Some(&reader) = remaining.first() {
                     return Err(PlanError::internal(format!(
-                        "dedup: map {} reads keyed {}, which only a join or a map built \
-                         here may read",
+                        "dedup: map {} reads keyed {}, which only a join, an aggregate, or a \
+                         map built here may read",
                         self.transformations[reader].output(),
                         tx.output()
                     )));
                 }
-                trace!("[dedup] {} is rows: no join reads it", tx.output());
+                trace!(
+                    "[dedup] {} is rows: no join or aggregate reads it",
+                    tx.output()
+                );
                 self.transformations[index] = tx.unkeyed();
             }
 
@@ -1245,6 +1249,83 @@ mod tests {
             "V unions the semijoin itself"
         );
         assert_eq!(txs.len(), 3, "two arrangements and the semijoin");
+        assert!(producers_precede_readers(stratum));
+    }
+
+    /// `CountB` counts the `b` column of the join `CountAB` counts, so
+    /// its matches become a map over that join. The join has no other
+    /// join reading it but still keeps its key: `CountAB`'s aggregate
+    /// reads it arranged, and having no groups makes that aggregate unary,
+    /// not a map.
+    #[test]
+    fn a_server_an_aggregate_reads_stays_keyed() {
+        let pp = program_planner(
+            "\
+            .decl T(a: int32, b: int32)\n\
+            .decl U(b: int32)\n\
+            .decl CountB(n: int32)\n\
+            .decl CountAB(n: int32)\n\
+            .input T(IO=\"file\", filename=\"T.csv\", delimiter=\",\")\n\
+            .input U(IO=\"file\", filename=\"U.csv\", delimiter=\",\")\n\
+            .output CountB\n\
+            .output CountAB\n\
+            CountB(n) :- n = count : { T(_, b), U(b) }.\n\
+            CountAB(n) :- n = count : { T(a, b), U(b) }.\n",
+        );
+        let stratum = &pp.strata()[0];
+        let txs = stratum.non_recursive_transformations();
+
+        let [join] = txs.iter().filter(|tx| !tx.is_unary()).collect::<Vec<_>>()[..] else {
+            panic!("one join of T and U");
+        };
+        assert!(matches!(join, Transformation::JnToKv { .. }));
+        let reads_join = |tx: &Transformation| {
+            tx.is_unary() && tx.unary_input().fingerprint() == join.output().fingerprint()
+        };
+        assert!(
+            txs.iter()
+                .any(|tx| matches!(tx, Transformation::KvToKv { .. }) && reads_join(tx)),
+            "CountB's matches are a map over the join"
+        );
+        assert!(
+            txs.iter()
+                .any(|tx| matches!(tx, Transformation::AggToRow { .. }) && reads_join(tx)),
+            "CountAB's aggregate reads the join"
+        );
+        assert!(producers_precede_readers(stratum));
+    }
+
+    /// Past `EXACT_COVER_LIMIT` members the greedy cover picks the
+    /// servers, and it too keeps a server keyed while an aggregate reads
+    /// it: the twelve copies of `K` are served from the sum's matches,
+    /// which the sum still reads arranged.
+    #[test]
+    fn a_greedy_server_an_aggregate_reads_stays_keyed() {
+        let copies: String = (1..=12).map(|n| format!("W({n}) :- K(_).\n")).collect();
+        let pp = program_planner(&format!(
+            ".decl K(x: int32)\n\
+             .decl W(n: int32)\n\
+             .input K(IO=\"file\", filename=\"K.csv\", delimiter=\",\")\n\
+             .output W\n\
+             {copies}\
+             W(s) :- s = sum x : {{ K(x) }}.\n"
+        ));
+        let stratum = &pp.strata()[0];
+        let txs = stratum.non_recursive_transformations();
+
+        let [aggregate] = txs
+            .iter()
+            .filter(|tx| matches!(tx, Transformation::AggToRow { .. }))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one sum");
+        };
+        let matches = aggregate.unary_input().fingerprint();
+        let producer = txs
+            .iter()
+            .find(|tx| tx.output().fingerprint() == matches)
+            .expect("the sum's matches are built in this stratum");
+        assert!(producer.need_arrange(), "the sum's matches stay keyed");
         assert!(producers_precede_readers(stratum));
     }
 }

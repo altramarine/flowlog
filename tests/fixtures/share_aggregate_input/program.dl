@@ -1,0 +1,23 @@
+// ============================================================================
+// Suite   : share_aggregate_input
+// Feature : an aggregate reading a collection that sharing serves other
+//           collections from
+// Covers  : the collection stays keyed for the aggregate, which reads it
+//           arranged though it reads nothing else (issue #469: planning
+//           stopped with an internal error): two counts over one join
+// ============================================================================
+
+// `CountAB` counts the join's `(a, b)` pairs and `CountB` its distinct `b`s,
+// a map over the same join.
+.decl T(a: int32, b: int32)
+.input T(IO="file", filename="T.csv", delimiter=",")
+.decl U(b: int32)
+.input U(IO="file", filename="U.csv", delimiter=",")
+
+.decl CountB(n: int32)
+CountB(n) :- n = count : { T(_, b), U(b) }.
+.output CountB
+
+.decl CountAB(n: int32)
+CountAB(n) :- n = count : { T(a, b), U(b) }.
+.output CountAB
