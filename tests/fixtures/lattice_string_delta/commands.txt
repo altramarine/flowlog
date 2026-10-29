@@ -1,0 +1,7 @@
+begin
+insert tag @Tag.csv
+commit
+begin
+delete tag 1,apple
+commit
+quit
