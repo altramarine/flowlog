@@ -1,7 +1,8 @@
 //! FlowLog program representation.
 //!
 //! A [`Program`] is the parser's output: everything needed to evaluate a
-//! FlowLog Datalog program. Build one with [`parse`](crate::parse).
+//! FlowLog Datalog program. Build one with [`parse_file`](crate::parse_file)
+//! or [`parse_str`](crate::parse_str).
 //!
 //! | Component | Description |
 //! |-----------|-------------|
@@ -31,9 +32,10 @@ use crate::types::TypeRegistry;
 
 /// A fully-parsed FlowLog program.
 ///
-/// Construct one with [`parse`](crate::parse); there is deliberately no
-/// `Default`, so parsing is the only way to build a `Program`, and the
-/// library otherwise exposes it read-only.
+/// Construct one with [`parse_file`](crate::parse_file) or
+/// [`parse_str`](crate::parse_str); there is deliberately no `Default`,
+/// so parsing is the only way to build a `Program`, and the library
+/// otherwise exposes it read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     /// All relation declarations (`.decl`), in source order.
@@ -72,6 +74,14 @@ impl Program {
         self.relations.iter().find(|rel| rel.fingerprint() == fp)
     }
 
+    /// Whether the relation of fingerprint `fp` has a lattice column. A
+    /// fingerprint of no relation has none.
+    #[must_use]
+    pub fn is_lattice(&self, fp: u64) -> bool {
+        self.relation_by_fingerprint(fp)
+            .is_some_and(|rel| rel.lattice().is_some())
+    }
+
     // --- EDB inputs (file-backed `.input` + inline facts) ---
 
     /// EDB relations available before rule evaluation starts.
@@ -106,6 +116,21 @@ impl Program {
     #[must_use]
     pub fn has_file_inputs(&self) -> bool {
         self.file_inputs().next().is_some()
+    }
+
+    /// Returns `true` if some relation is an input, loaded from a file or
+    /// given inline facts ([`Self::edbs`]).
+    #[must_use]
+    pub fn has_inputs(&self) -> bool {
+        self.relations.iter().any(|rel| self.is_edb_relation(rel))
+    }
+
+    /// Returns `true` if no relation is left. Pruning keeps only what an
+    /// output needs, so after it a program whose every output was pruned
+    /// is empty: it has nothing to compute.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.relations.is_empty()
     }
 
     /// Returns `true` if some relation has an `.output` directive.
@@ -256,6 +281,7 @@ mod tests {
     use crate::Mutability;
     use crate::Relation;
     use crate::test_harness::assembled;
+    use crate::test_harness::pruned;
 
     #[test]
     fn rules_are_returned_in_source_order() {
@@ -273,6 +299,37 @@ mod tests {
         let rules = program.rules();
         assert_eq!(rules.len(), 3);
         assert!(rules[1].to_string().contains("2"));
+    }
+
+    /// A relation is a lattice when one of its columns is declared one; a
+    /// fingerprint of no relation is not.
+    // Cases: relation looked up, expected.
+    #[rstest]
+    #[case::lattice_relation(Some("dist"), true)]
+    #[case::plain_relation(Some("edge"), false)]
+    #[case::no_relation(None, false)]
+    fn is_lattice_follows_the_declared_column(
+        #[case] relation: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let program = assembled(
+            "
+            .decl edge(x: number, y: number)
+            .decl dist(x: number, d: min<number>)
+            .output dist
+            dist(X, 0) :- edge(X, _).
+            ",
+        )
+        .expect("assembles");
+        let fp = relation.map_or(u64::MAX, |name| {
+            program
+                .relations()
+                .iter()
+                .find(|rel| rel.name() == name)
+                .expect("declared")
+                .fingerprint()
+        });
+        assert_eq!(program.is_lattice(fp), expected);
     }
 
     #[test]
@@ -379,6 +436,30 @@ mod tests {
             assembled(src).expect("assembles").is_incremental(),
             expected
         );
+    }
+
+    /// An input is a relation loaded from a file or given inline facts; a
+    /// relation only rules derive is none.
+    // Cases: program, has inputs.
+    #[rstest]
+    #[case::file_input(".decl E(x: number) .input E .output E", true)]
+    #[case::inline_facts(".decl R(x: number) .output R R(1).", true)]
+    #[case::derived_only(".decl P(x: number) P(x) :- P(x). .output P", false)]
+    fn has_inputs_counts_files_and_inline_facts(#[case] src: &str, #[case] expected: bool) {
+        assert_eq!(assembled(src).expect("assembles").has_inputs(), expected);
+    }
+
+    /// A program is empty once pruning removed its every output, as it
+    /// does an output nothing derives; an output a rule derives stays.
+    // Cases: program, empty after pruning.
+    #[rstest]
+    #[case::every_output_pruned(".decl A(x: int32) .output A", true)]
+    #[case::output_derived(".decl P(x: number) P(x) :- P(x). .output P", false)]
+    fn a_program_is_empty_when_pruning_removed_every_output(
+        #[case] src: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(pruned(src).expect("prunes").is_empty(), expected);
     }
 
     /// Only an `.input` with a file behind it is a file input: inline

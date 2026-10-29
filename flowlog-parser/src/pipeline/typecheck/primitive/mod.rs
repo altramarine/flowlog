@@ -35,12 +35,13 @@ use crate::HeadArg;
 use crate::ParseError;
 use crate::Predicate;
 use crate::Program;
+use crate::Variable;
 use crate::pipeline::typecheck::env::PrimitiveEnv;
 
 /// Var -> (first-seen type, first-seen span). Later uses must agree.
 /// Private, so it stays confined to the `primitive` subtree; the subtype
 /// pass keeps its own `TypeId`-keyed map.
-type Bindings = HashMap<String, (DataType, Span)>;
+type Bindings = HashMap<Variable, (DataType, Span)>;
 
 /// Run Pass 1 over `program`: check every primitive `DataType`, pin each
 /// polymorphic literal to its concrete width, and check `ord` usage (which
@@ -62,7 +63,7 @@ pub(crate) fn check_and_pin(
 /// `ord` stays deterministic across worker counts.
 fn check_ord(program: &Program, config: &mut Config) -> Result<(), ParseError> {
     fn arith(a: &Arithmetic) -> Option<Span> {
-        factor(a.init()).or_else(|| a.rest().iter().find_map(|(_, f)| factor(f)))
+        a.factors().find_map(factor)
     }
     fn factor(f: &Factor) -> Option<Span> {
         match f {
@@ -72,24 +73,32 @@ fn check_ord(program: &Program, config: &mut Config) -> Result<(), ParseError> {
             Factor::Builtin(bc) => bc.args().iter().find_map(arith),
             Factor::Cast(c) => factor(c.inner()),
             Factor::Group(a) => arith(a),
-            Factor::Tuple(r) => r.exprs().find_map(arith),
+            Factor::Tuple(fields) => fields.iter().find_map(arith),
             Factor::TupleProj { tuple, .. } => arith(tuple),
+            // Rule construction hoisted every aggregate into a binding and
+            // named every placeholder.
+            Factor::Placeholder | Factor::Aggregate(_) => None,
         }
+    }
+    fn body(predicates: &[Predicate]) -> Option<Span> {
+        predicates.iter().find_map(|predicate| match predicate {
+            Predicate::PositiveAtom(_) | Predicate::NegativeAtom(_) => None,
+            Predicate::Compare(cmp) => arith(cmp.left()).or_else(|| arith(cmp.right())),
+            Predicate::Aggregate(aggregate) => aggregate
+                .target()
+                .and_then(arith)
+                .or_else(|| body(aggregate.body())),
+        })
     }
 
     let ord_span = program.rules().iter().find_map(|rule| {
-        let body = rule.rhs().iter().find_map(|predicate| match predicate {
-            Predicate::PositiveAtom(_) | Predicate::NegativeAtom(_) => None,
-            Predicate::Compare(cmp) => arith(cmp.left()).or_else(|| arith(cmp.right())),
-        });
-        body.or_else(|| {
+        body(rule.rhs()).or_else(|| {
             rule.head()
                 .head_arguments()
                 .iter()
                 .find_map(|head_arg| match head_arg {
                     HeadArg::Var(_) => None,
                     HeadArg::Arith(a) => arith(a),
-                    HeadArg::Aggregation(agg) => arith(agg.arithmetic()),
                 })
         })
     });
@@ -118,6 +127,18 @@ mod tests {
             .input In(IO=\"file\", filename=\"In.csv\", delimiter=\",\")\n\
             .output Out\n\
             Out(ord(s)) :- In(s).\n";
+        assert_err!(checked(src), ParseError::OrdRequiresStrIntern { .. });
+    }
+
+    /// The `ord` gate looks inside aggregates too.
+    #[test]
+    fn ord_inside_an_aggregate_requires_str_intern() {
+        let src = "\
+            .decl In(s: symbol)\n\
+            .decl Out(s: symbol, n: int32)\n\
+            .input In(IO=\"file\", filename=\"In.csv\", delimiter=\",\")\n\
+            .output Out\n\
+            Out(s, n) :- In(s), n = count : { In(t), ord(t) > 0 }.\n";
         assert_err!(checked(src), ParseError::OrdRequiresStrIntern { .. });
     }
 }

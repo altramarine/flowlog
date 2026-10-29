@@ -1,0 +1,12 @@
+// ============================================================================
+// Suite   : lattice_string_delta
+// Feature : min<string> lattice columns in inc mode
+// Covers  : deleting a key's least text hands its answer to the next text
+// ============================================================================
+
+.decl Tag(k: int32, s: string) mutable
+.input Tag(IO="command", delimiter=",")
+
+.decl First(k: int32, s: min<string>)
+First(k, s) :- Tag(k, s).
+.output First

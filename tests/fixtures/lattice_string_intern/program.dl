@@ -1,0 +1,15 @@
+// ============================================================================
+// Suite   : lattice_string_intern
+// Feature : min<string> lattice columns under --str-intern
+// Covers  : the merge compares texts, not interned keys: each key's first
+//           row, interned first, is not its least text, so comparing keys
+//           would answer it instead (issue #466: the generated crate
+//           ascribed a `String` to the interned column)
+// ============================================================================
+
+.decl Tag(k: int32, s: string)
+.input Tag(IO="file", filename="Tag.csv", delimiter=",")
+
+.decl First(k: int32, s: min<string>)
+First(k, s) :- Tag(k, s).
+.output First

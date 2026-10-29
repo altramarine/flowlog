@@ -10,6 +10,7 @@ use educe::Educe;
 use flowlog_common::Span;
 
 use super::Arithmetic;
+use super::Variable;
 use crate::Lexeme;
 use crate::Node;
 use crate::Rule;
@@ -217,7 +218,7 @@ impl ComparisonExpr {
 
     /// Unique variables referenced across both operands.
     #[must_use]
-    pub fn vars_set(&self) -> HashSet<&String> {
+    pub fn vars_set(&self) -> HashSet<&Variable> {
         let mut vars = self.left.vars_set();
         vars.extend(self.right.vars_set());
         vars
@@ -238,9 +239,10 @@ impl Lexeme for ComparisonExpr {
     fn from_parsed_rule(node: Node) -> Result<Self, ParseError> {
         let span = node.span();
         match node.rule() {
-            Rule::compare_expr | Rule::paren_item => {
-                // A comparison inside shared parentheses has the same three
-                // children as `compare_expr`; only its enclosing rule differs.
+            Rule::compare_expr | Rule::paren_item | Rule::aggregate_item => {
+                // A comparison inside shared parentheses or an aggregate body
+                // has the same three children as `compare_expr`; only its
+                // enclosing rule differs.
                 let mut children = node.children();
                 let left = children.lower_next("left operand")?;
                 let operator = children.lower_next("comparison operator")?;
@@ -454,8 +456,12 @@ mod tests {
     #[test]
     fn vars_set_deduplicates_across_both_operands() {
         let expr: ComparisonExpr = parse_node(Rule::compare_expr, "x + x > x + y");
-        let vars: HashSet<_> = expr.vars_set().into_iter().map(String::as_str).collect();
-        assert_eq!(vars, HashSet::from(["x", "y"]));
+        let vars: HashSet<String> = expr
+            .vars_set()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(vars, HashSet::from(["x".to_string(), "y".to_string()]));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! This module implements the prepare phase of rule planning, focusing on applying
 //! local filters (variable equality, constant equality, and placeholders) to simplify
-//! the rule before the core planning phase.
+//! the rule before the first step, a join or an aggregate.
 //!
 //! It is socalled "alpha-elimination" because it eliminates variables by applying
 //! constraints, similar GYO algorithm to determine acyclicity.
@@ -235,6 +235,7 @@ impl RulePlanner {
 #[cfg(test)]
 mod tests {
     use flowlog_parser::DataType;
+    use flowlog_parser::Variable;
 
     use super::*;
     use crate::test_harness::recursive_rule_planner;
@@ -355,7 +356,10 @@ mod tests {
 
         let semijoin = planner.transformation_infos().last().unwrap();
         assert_eq!(semijoin.input_name(), ("a", Some("b")));
-        assert_eq!(semijoin.output_variables(), vec![Some("x"), Some("y")]);
+        assert_eq!(
+            semijoin.output_variables(),
+            vec![Some(&Variable::from("x")), Some(&Variable::from("y"))]
+        );
     }
 
     #[test]

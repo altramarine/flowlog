@@ -10,8 +10,9 @@
 //!   checked, optimized [`Program`], in execution order.
 //! - `program`: what comes out; the [`Program`] container.
 //!
-//! [`parse`] runs the whole pipeline; [`check_program`],
-//! [`fold_constants`], and [`prune`] expose the individual stages.
+//! [`parse_file`] runs the whole pipeline over a file and [`parse_str`]
+//! over text held in memory; [`check_program`], [`fold_constants`], and
+//! [`prune`] expose the individual stages.
 
 mod error;
 mod pipeline;
@@ -26,7 +27,7 @@ pub mod test_harness;
 // while living under `syntax/`; the alias saves every consumer from
 // carrying the extra path segment.
 // Public API: the parsed AST.
-pub use ast::Aggregation;
+pub use ast::AggregateExpr;
 pub use ast::AggregationOperator;
 pub use ast::Arithmetic;
 pub use ast::ArithmeticOperator;
@@ -44,19 +45,21 @@ pub use ast::FnCall;
 pub use ast::Head;
 pub use ast::HeadArg;
 pub use ast::Predicate;
-pub use ast::TupleElem;
-pub use ast::TupleLit;
+pub use ast::Variable;
 pub use declaration::Attribute;
 pub use declaration::ExternFn;
 pub use declaration::InputSource;
+pub use declaration::Lattice;
 pub use declaration::Mutability;
 pub use declaration::OrderKey;
 pub use declaration::OutputSink;
 pub use declaration::Relation;
 pub use error::DirectiveKind;
 pub use error::ParseError;
+pub use error::UnsafePredicateKind;
 pub use pipeline::fold::fold_constants;
-pub use pipeline::parse;
+pub use pipeline::parse_file;
+pub use pipeline::parse_str;
 pub use pipeline::prune::prune;
 pub use pipeline::typecheck::check_program;
 pub use program::InlineFact;

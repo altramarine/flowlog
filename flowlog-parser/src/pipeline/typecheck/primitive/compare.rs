@@ -24,7 +24,8 @@ pub(super) fn check_and_pin_compare(
     let span = cmp.span();
 
     // String constraints (`match`/`contains`) take two string operands and
-    // produce a bool; they don't pin operand widths like value comparisons.
+    // produce a bool. The operands are still pinned: a computed operand such
+    // as `substr(s, i, i + 1)` carries integer literals of its own.
     if op.is_string_constraint() {
         for kind in [&left, &right].into_iter().flatten() {
             if !matches!(kind, DataType::String) {
@@ -35,6 +36,8 @@ pub(super) fn check_and_pin_compare(
                 });
             }
         }
+        pin_expr(cmp.left_mut(), &DataType::String, bindings, udfs)?;
+        pin_expr(cmp.right_mut(), &DataType::String, bindings, udfs)?;
         return Ok(());
     }
 
@@ -104,6 +107,34 @@ mod tests {
         };
         match cmp.right().init() {
             Factor::Const(c) => assert_eq!(c, &Constant::new(DataType::Int16, "100")),
+            other => panic!("expected Const, got {other:?}"),
+        }
+    }
+
+    /// A string constraint pins the literals inside its operands as any
+    /// other comparison does: the `1` in `substr(s, i, i + 1)` becomes an
+    /// `int32`. Left polymorphic, it would reach codegen as an internal
+    /// error.
+    #[test]
+    fn string_constraint_operand_literal_pinned() {
+        let src = "\
+            .decl Item(s: string, i: int32)\n\
+            .decl Out(s: string)\n\
+            .input Item(IO=\"file\", filename=\"Item.csv\", delimiter=\",\")\n\
+            .output Out\n\
+            Out(s) :- Item(s, i), contains(\"a\", substr(s, i, i + 1)).\n";
+        let program = checked(src).expect("type-check should succeed");
+        let rule = &program.rules()[0];
+        let cmp = match &rule.rhs()[1] {
+            Predicate::Compare(c) => c,
+            other => panic!("expected comparison, got {other:?}"),
+        };
+        let end = match cmp.right().init() {
+            Factor::Builtin(call) => &call.args()[2],
+            other => panic!("expected substr call, got {other:?}"),
+        };
+        match &end.rest()[0].1 {
+            Factor::Const(c) => assert_eq!(c, &Constant::new(DataType::Int32, "1")),
             other => panic!("expected Const, got {other:?}"),
         }
     }

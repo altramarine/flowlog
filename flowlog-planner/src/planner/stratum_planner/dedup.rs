@@ -50,8 +50,8 @@ impl StratumPlanner {
     /// Returns an internal error if the result has a cycle, or if a map
     /// the rule planner built reads a keyed collection. Neither happens:
     /// a map is only ever placed over a computed collection of the same
-    /// body, and fuse merges every map into its producer unless it reads
-    /// a relation.
+    /// body, and the rule planner writes a collection only maps read as
+    /// rows.
     pub(super) fn dedup_transformations(
         &mut self,
         preludes: &[Transformation],
@@ -153,16 +153,17 @@ impl StratumPlanner {
     /// the same body have the same mutability, so a server never changes
     /// what a reader receives (see `docs/design/mutability.md`).
     ///
-    /// A keyed output is the shape a join reads. A server whose joins are
-    /// all served here is read by maps alone afterwards, so it is held as
-    /// rows before the maps over it are built, and a served member whose
-    /// form then equals its server's is aliased to it rather than mapped.
+    /// A keyed output is the shape a join or an aggregate reads. A server
+    /// whose joins and aggregates are all served here is read by maps
+    /// alone afterwards, so it is held as rows before the maps over it are
+    /// built, and a served member whose form then equals its server's is
+    /// aliased to it rather than mapped.
     ///
     /// # Errors
     ///
     /// Returns an internal error if a map this pass did not build reads a
-    /// keyed collection. The rule planner produces none: fuse merges every
-    /// map into its producer unless it reads a relation.
+    /// keyed collection. The rule planner produces none: it writes a
+    /// collection only maps read as rows.
     fn cover_bodies(&mut self, preludes: &[Transformation]) -> Result<(), PlanError> {
         let heads: HashSet<u64> = self.idb_to_heads_map.values().flatten().copied().collect();
         // Readers by input fingerprint, as indices into this stratum's own
@@ -207,8 +208,8 @@ impl StratumPlanner {
                 }
             }
 
-            // A server no join reads any more is held as rows before the
-            // maps over it are built, so their flows read rows.
+            // A server no join or aggregate reads any more is held as rows
+            // before the maps over it are built, so their flows read rows.
             for &member in &cover.computed {
                 let Some(index) = own(member) else {
                     continue;
@@ -222,19 +223,22 @@ impl StratumPlanner {
                     .map_or(&[][..], Vec::as_slice);
                 if remaining
                     .iter()
-                    .any(|&reader| !self.transformations[reader].is_unary())
+                    .any(|&reader| !self.transformations[reader].is_map())
                 {
                     continue;
                 }
                 if let Some(&reader) = remaining.first() {
                     return Err(PlanError::internal(format!(
-                        "dedup: map {} reads keyed {}, which only a join or a map built \
-                         here may read",
+                        "dedup: map {} reads keyed {}, which only a join, an aggregate, or a \
+                         map built here may read",
                         self.transformations[reader].output(),
                         tx.output()
                     )));
                 }
-                trace!("[dedup] {} is rows: no join reads it", tx.output());
+                trace!(
+                    "[dedup] {} is rows: no join or aggregate reads it",
+                    tx.output()
+                );
                 self.transformations[index] = tx.unkeyed();
             }
 
@@ -678,7 +682,6 @@ mod tests {
     use crate::planner::StratumPlanner;
     use crate::planner::Transformation;
     use crate::planner::TransformationArgument;
-    use crate::planner::TransformationFlow;
     use crate::test_harness::program_planner;
 
     const WIDE_NARROW: &str = "\
@@ -851,86 +854,68 @@ mod tests {
         assert_eq!(stratum.non_recursive_transformations().len(), 3);
     }
 
-    /// A rule whose head aggregates ends in a reduce over the rows its
-    /// body derives, and those rows are shared like any other: Deg's
-    /// reduce reads the join Pair's head is, so the join runs once.
+    /// A lattice relation's rule plans as a plain rule: the merge belongs
+    /// to the relation, applied once over its heads by codegen, so the
+    /// rows the rule derives are shared like any other. Deg's head is the
+    /// very join Pair's head is.
     #[test]
-    fn an_aggregating_rule_reduces_the_rows_a_plain_rule_shares() {
+    fn a_lattice_relations_rule_plans_as_a_plain_rule() {
         let pp = program_planner(
             "\
             .decl Edge(x: int32, y: int32)\n\
             .decl Node(x: int32)\n\
-            .decl Deg(x: int32, n: int32)\n\
+            .decl Deg(x: int32, n: min<int32>)\n\
             .decl Pair(x: int32, y: int32)\n\
             .input Edge(IO=\"file\", filename=\"Edge.csv\", delimiter=\",\")\n\
             .input Node(IO=\"file\", filename=\"Node.csv\", delimiter=\",\")\n\
             .output Deg\n\
             .output Pair\n\
-            Deg(x, count(y)) :- Edge(x, y), Node(x).\n\
+            Deg(x, y) :- Edge(x, y), Node(x).\n\
             Pair(x, y) :- Edge(x, y), Node(x).\n",
         );
         let stratum = &pp.strata()[0];
-        let txs = stratum.non_recursive_transformations();
         let [deg_head] = stratum.idb_to_heads_map()[&compute_fp("deg")][..] else {
             panic!("Deg has one head");
         };
         let [pair_head] = stratum.idb_to_heads_map()[&compute_fp("pair")][..] else {
             panic!("Pair has one head");
         };
-
-        let reduce = txs
-            .iter()
-            .find(|tx| tx.output().fingerprint() == deg_head)
-            .expect("Deg's head is produced");
-        assert!(matches!(
-            reduce,
-            Transformation::RowToRow {
-                flow: TransformationFlow::Reduce { .. },
-                ..
-            }
-        ));
-        assert_eq!(reduce.unary_input().fingerprint(), pair_head);
+        assert_eq!(deg_head, pair_head);
+        let txs = stratum.non_recursive_transformations();
         assert_eq!(txs.iter().filter(|tx| !tx.is_unary()).count(), 1);
         assert!(producers_precede_readers(stratum));
     }
 
-    /// Rules aggregating the same rows end in reduces over one shared
-    /// collection, one reduce per rule: a different operator is a
-    /// different answer, and so is the same operator for another relation,
-    /// whose declaration may type the answer differently.
+    /// A recursive lattice relation plans as plain recursion: the base
+    /// rule's stratum comes first, and the recursive rule's stratum holds
+    /// one head and one join in its loop. The merge is codegen's.
     #[test]
-    fn reduces_share_their_rows_but_answer_per_relation() {
+    fn a_recursive_lattice_relation_plans_as_plain_recursion() {
         let pp = program_planner(
             "\
-            .decl Orders(id: int32, amount: int32)\n\
-            .decl Total(n: int32)\n\
-            .decl Count(n: int32)\n\
-            .decl Again(n: int32)\n\
-            .input Orders(IO=\"file\", filename=\"Orders.csv\", delimiter=\",\")\n\
-            .output Total\n\
-            .output Count\n\
-            .output Again\n\
-            Total(sum(amount)) :- Orders(_, amount).\n\
-            Count(count(amount)) :- Orders(_, amount).\n\
-            Again(count(amount)) :- Orders(_, amount).\n",
+            .decl Source(n: int32)\n\
+            .decl Edge(x: int32, y: int32, w: int32)\n\
+            .decl Dist(n: int32, d: min<int32>)\n\
+            .input Source(IO=\"file\", filename=\"Source.csv\", delimiter=\",\")\n\
+            .input Edge(IO=\"file\", filename=\"Edge.csv\", delimiter=\",\")\n\
+            .output Dist\n\
+            Dist(s, 0) :- Source(s).\n\
+            Dist(y, d + w) :- Dist(x, d), Edge(x, y, w).\n",
         );
-        let stratum = &pp.strata()[0];
-        let txs = stratum.non_recursive_transformations();
-        let head = |name: &str| stratum.idb_to_heads_map()[&compute_fp(name)][0];
-
-        assert_ne!(head("total"), head("count"));
-        assert_ne!(head("count"), head("again"));
-        let reduces: Vec<_> = txs
+        let stratum = pp
+            .strata()
             .iter()
-            .filter(|tx| tx.flow().aggregate().is_some())
-            .collect();
-        assert_eq!(reduces.len(), 3);
-        let inputs: HashSet<u64> = reduces
-            .iter()
-            .map(|tx| tx.unary_input().fingerprint())
-            .collect();
-        assert_eq!(inputs.len(), 1);
-        assert!(producers_precede_readers(stratum));
+            .find(|stratum| stratum.is_recursive())
+            .expect("the recursive rule's stratum");
+        assert_eq!(stratum.idb_to_heads_map()[&compute_fp("dist")].len(), 1);
+        assert_eq!(
+            stratum
+                .recursive_transformations()
+                .iter()
+                .filter(|tx| !tx.is_unary())
+                .count(),
+            1
+        );
     }
 
     /// Both rules output the same computed string over the same join, and
@@ -1264,6 +1249,83 @@ mod tests {
             "V unions the semijoin itself"
         );
         assert_eq!(txs.len(), 3, "two arrangements and the semijoin");
+        assert!(producers_precede_readers(stratum));
+    }
+
+    /// `CountB` counts the `b` column of the join `CountAB` counts, so
+    /// its matches become a map over that join. The join has no other
+    /// join reading it but still keeps its key: `CountAB`'s aggregate
+    /// reads it arranged, and having no groups makes that aggregate unary,
+    /// not a map.
+    #[test]
+    fn a_server_an_aggregate_reads_stays_keyed() {
+        let pp = program_planner(
+            "\
+            .decl T(a: int32, b: int32)\n\
+            .decl U(b: int32)\n\
+            .decl CountB(n: int32)\n\
+            .decl CountAB(n: int32)\n\
+            .input T(IO=\"file\", filename=\"T.csv\", delimiter=\",\")\n\
+            .input U(IO=\"file\", filename=\"U.csv\", delimiter=\",\")\n\
+            .output CountB\n\
+            .output CountAB\n\
+            CountB(n) :- n = count : { T(_, b), U(b) }.\n\
+            CountAB(n) :- n = count : { T(a, b), U(b) }.\n",
+        );
+        let stratum = &pp.strata()[0];
+        let txs = stratum.non_recursive_transformations();
+
+        let [join] = txs.iter().filter(|tx| !tx.is_unary()).collect::<Vec<_>>()[..] else {
+            panic!("one join of T and U");
+        };
+        assert!(matches!(join, Transformation::JnToKv { .. }));
+        let reads_join = |tx: &Transformation| {
+            tx.is_unary() && tx.unary_input().fingerprint() == join.output().fingerprint()
+        };
+        assert!(
+            txs.iter()
+                .any(|tx| matches!(tx, Transformation::KvToKv { .. }) && reads_join(tx)),
+            "CountB's matches are a map over the join"
+        );
+        assert!(
+            txs.iter()
+                .any(|tx| matches!(tx, Transformation::AggToRow { .. }) && reads_join(tx)),
+            "CountAB's aggregate reads the join"
+        );
+        assert!(producers_precede_readers(stratum));
+    }
+
+    /// Past `EXACT_COVER_LIMIT` members the greedy cover picks the
+    /// servers, and it too keeps a server keyed while an aggregate reads
+    /// it: the twelve copies of `K` are served from the sum's matches,
+    /// which the sum still reads arranged.
+    #[test]
+    fn a_greedy_server_an_aggregate_reads_stays_keyed() {
+        let copies: String = (1..=12).map(|n| format!("W({n}) :- K(_).\n")).collect();
+        let pp = program_planner(&format!(
+            ".decl K(x: int32)\n\
+             .decl W(n: int32)\n\
+             .input K(IO=\"file\", filename=\"K.csv\", delimiter=\",\")\n\
+             .output W\n\
+             {copies}\
+             W(s) :- s = sum x : {{ K(x) }}.\n"
+        ));
+        let stratum = &pp.strata()[0];
+        let txs = stratum.non_recursive_transformations();
+
+        let [aggregate] = txs
+            .iter()
+            .filter(|tx| matches!(tx, Transformation::AggToRow { .. }))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one sum");
+        };
+        let matches = aggregate.unary_input().fingerprint();
+        let producer = txs
+            .iter()
+            .find(|tx| tx.output().fingerprint() == matches)
+            .expect("the sum's matches are built in this stratum");
+        assert!(producer.need_arrange(), "the sum's matches stay keyed");
         assert!(producers_precede_readers(stratum));
     }
 }

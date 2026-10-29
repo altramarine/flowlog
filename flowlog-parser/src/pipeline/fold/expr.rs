@@ -9,8 +9,7 @@ use crate::pipeline::fold::eval::eval_arith;
 /// Post-order: fold each sub-expression, then collapse a fully-constant
 /// multi-term `Arithmetic` into one `Const`.
 pub(super) fn fold_arith(a: &mut Arithmetic) {
-    fold_factor(a.init_mut());
-    for (_, f) in a.rest_mut() {
+    for f in a.factors_mut() {
         fold_factor(f);
     }
     if let Some(folded) = try_eval(a) {
@@ -45,14 +44,20 @@ fn fold_factor(f: &mut Factor) {
                 fold_arith(arg);
             }
         }
-        Factor::Tuple(t) => {
-            for a in t.exprs_mut() {
+        Factor::Tuple(fields) => {
+            for a in fields {
                 fold_arith(a);
             }
         }
         Factor::TupleProj { tuple, .. } => fold_arith(tuple),
-        // Casts are stripped by the subtype pass before folding runs.
-        Factor::Var(_) | Factor::Const(_) | Factor::Cast(_) => {}
+        // Casts are stripped by the subtype pass before folding runs, and
+        // rule construction hoisted every aggregate into a binding and
+        // named every placeholder.
+        Factor::Var(_)
+        | Factor::Const(_)
+        | Factor::Cast(_)
+        | Factor::Placeholder
+        | Factor::Aggregate(_) => {}
     }
 }
 

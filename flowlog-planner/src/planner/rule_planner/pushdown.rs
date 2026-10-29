@@ -7,7 +7,7 @@
 //! semijoin or antijoin arranges its retained input, and the arrangement
 //! is kept in memory and maintained on every update. On small inputs or
 //! under incremental evaluation the arrangements cost more than the rows
-//! they save, so prepare and core fold each filter into exactly ONE
+//! they save, so prepare and the join steps fold each filter into exactly ONE
 //! superset, the minimum that keeps the rule correct.
 //!
 //! One application is often enough. Once the filtered atom joins another
@@ -18,7 +18,7 @@
 //! discarded ones is wasted work.
 //!
 //! Take `Out(x, y, z, w, v) :- C(x, z, v), D(z, w), B(x, y), A(x)`. The fold
-//! picks `B` for `A`, and core joins in body order:
+//! picks `B` for `A`, and the join steps go in body order:
 //!
 //! ```text
 //! ((C join D) join (A semijoin B))
@@ -42,18 +42,25 @@
 //! to it, and the chain's column names come from that reader. Names
 //! cannot live on the node: two atoms of one relation can plan the same
 //! transformation, share its fingerprint, and name the same column
-//! differently. The walk is documented on [`RulePlanner::push_into`] and
-//! the shape of a copy on [`RulePlanner::insert_copy`].
+//! differently. A fold holds within its scope, the rule's body or the
+//! braces of an aggregate, so each scope is walked on its own with the
+//! folds inside it; [`RulePlanner::scopes`] tells them apart. The walk is
+//! documented on [`RulePlanner::push_into`] and the shape of a copy on
+//! [`RulePlanner::insert_copy`].
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 
+use flowlog_parser::Variable;
 use tracing::trace;
 
 use super::RulePlanner;
 use crate::catalog::ArithmeticPos;
 use crate::catalog::AtomArgumentSignature;
+use crate::catalog::AtomSignature;
 use crate::catalog::Catalog;
+use crate::catalog::FactorPos;
 use crate::catalog::JoinPredicates;
 use crate::planner::KeyValueLayout;
 use crate::planner::PlanError;
@@ -63,8 +70,8 @@ use crate::planner::TransformationInfo;
 // Filter
 // =========================================================================
 
-/// A folded original atom, as its first application in the plan describes
-/// it.
+/// A folded original atom, as the semijoin or antijoin that folded it
+/// describes it.
 ///
 /// Every copy reuses these: the filter is arranged once, by `layout`, and
 /// every semijoin or antijoin against it shares that arrangement.
@@ -77,9 +84,34 @@ struct Filter {
     /// values.
     layout: KeyValueLayout,
     /// Variable names of `layout`'s keys, in key order.
-    key_names: Vec<String>,
+    key_names: Vec<Variable>,
     /// Whether copies are semijoins (`true`) or antijoins (`false`).
     positive: bool,
+}
+
+/// One scope of the plan: the rule's body or the braces of an aggregate.
+struct Scope {
+    /// The collection the scope's plan ends in, where its walk starts.
+    root: u64,
+    /// The transformations the walk may enter: the scope's own and those
+    /// of the scopes nested in it. A fold of the enclosing scope reaches
+    /// into the braces, as its rows agree with the groups; a fold inside
+    /// the braces holds for the matches alone, so its walk stops at what
+    /// the enclosing scope produces, the keys the braces start from first
+    /// of all.
+    transformations: BTreeSet<usize>,
+    /// The folds of original filters inside the scope, in pipeline order.
+    filters: Vec<Filter>,
+}
+
+/// What the walk for one scope reads.
+struct Walk<'a> {
+    /// The rule's original atoms.
+    originals: &'a BTreeSet<u64>,
+    /// The collections folded as filters anywhere in the plan.
+    folded_filters: &'a BTreeSet<u64>,
+    /// The transformations the walk may enter.
+    transformations: &'a BTreeSet<usize>,
 }
 
 // =========================================================================
@@ -112,7 +144,7 @@ impl Side {
 /// that reader (`None` for a column that is not a plain variable).
 struct View {
     positions: Vec<ArithmeticPos>,
-    names: Vec<Option<String>>,
+    names: Vec<Option<Variable>>,
 }
 
 impl View {
@@ -124,7 +156,7 @@ impl View {
             names: tx
                 .output_variables()
                 .into_iter()
-                .map(|name| name.map(str::to_string))
+                .map(|name| name.cloned())
                 .collect(),
         }
     }
@@ -158,10 +190,10 @@ impl View {
     }
 
     /// Column holding the variable `name`, if any.
-    fn column(&self, name: &str) -> Option<usize> {
+    fn column(&self, name: &Variable) -> Option<usize> {
         self.names
             .iter()
-            .position(|column| column.as_deref() == Some(name))
+            .position(|column| column.as_ref() == Some(name))
     }
 
     /// Returns `true` if every variable of `filter` is a column.
@@ -181,39 +213,57 @@ impl RulePlanner {
     /// that cover its variables, following the rules in the module
     /// documentation. The output tuple set does not change.
     ///
-    /// Runs after core, when the catalog holds the single atom that names
-    /// the plan's root, and before fuse, which expects consumers to point
-    /// at their final producers.
+    /// Each scope of the plan is walked from its own root with its own
+    /// folds: the rule's body from the plan's root, the braces of each
+    /// aggregate from their matches. A fold inside braces holds for the
+    /// matches alone, never for the groups answered with no match, so it
+    /// is copied nowhere outside them; a fold of the enclosing scope
+    /// reaches into the braces through the aggregate's matches, as its
+    /// rows agree with the groups.
+    ///
+    /// Runs after the last step, when the catalog holds the single atom
+    /// that names the plan's root, and before fuse, which expects consumers
+    /// to point at their final producers.
     pub(crate) fn pushdown(&mut self, catalog: &Catalog) -> Result<(), PlanError> {
-        if self.folded_filters.is_empty() {
-            return Ok(());
-        }
         let root = catalog.positive_atom_fingerprint(0)?;
         let originals = catalog.original_atom_fingerprints();
         // Described before any copy is inserted, so every filter is read
-        // from the plan as core left it.
-        let filters = self
-            .folded_filters
-            .iter()
-            .filter(|&&fp| self.is_narrowed_original(fp, originals))
-            .map(|&fp| self.folded_filter(fp))
-            .collect::<Result<Vec<_>, _>>()?;
-        let root_index = self.producer(root).ok_or_else(|| {
-            PlanError::internal(format!("pushdown: root {root:#018x} has no producer"))
-        })?;
+        // from the plan as the steps left it.
+        let scopes = self.scopes(root, originals)?;
+        let folded_filters = self.folded_filters();
         let count = self.transformation_infos.len();
-        for filter in &filters {
-            // An atom of constants, such as `isMethod("<...run()>")` in
-            // DOOP, folds as a semijoin with no key: an existence test. It
-            // covers every node, and a copy anywhere would shrink nothing.
-            if filter.key_names.is_empty() {
+        for Scope {
+            root,
+            transformations,
+            filters,
+        } in &scopes
+        {
+            if filters.is_empty() {
                 continue;
             }
-            let view = View::of_output(&self.transformation_infos[root_index]);
-            // A copy wanted on the root's own edge is dropped: the root has
-            // no edge above it, and a copy there would repeat the fold that
-            // already applies the filter on the way to the root.
-            self.push_into(filter, root, &view, false, originals)?;
+            let root_index = self.producer(*root).ok_or_else(|| {
+                PlanError::internal(format!("pushdown: root {root:#018x} has no producer"))
+            })?;
+            let walk = Walk {
+                originals,
+                folded_filters: &folded_filters,
+                transformations,
+            };
+            for filter in filters {
+                // An atom of constants, such as `isMethod("<...run()>")` in
+                // DOOP, folds as a semijoin with no key: an existence test.
+                // It covers every node, and a copy anywhere would shrink
+                // nothing.
+                if filter.key_names.is_empty() {
+                    continue;
+                }
+                let view = View::of_output(&self.transformation_infos[root_index]);
+                // A copy wanted on the root's own edge is dropped: the root
+                // has no edge above it, and a copy there would repeat the
+                // fold that already applies the filter on the way to the
+                // root.
+                self.push_into(filter, *root, &view, false, &walk)?;
+            }
         }
         if self.transformation_infos.len() != count {
             self.sort_pipeline(originals)?;
@@ -231,10 +281,108 @@ impl RulePlanner {
             }
         }
         trace!(
-            "Transformation infos after pushdown:\n{}",
+            "Transformations after pushdown:\n{}",
             self.transformation_infos_dump()
         );
         Ok(())
+    }
+
+    /// The scopes of the plan under `root`: the rule's body first, then
+    /// the braces of each aggregate, whose matches are their root, each
+    /// with the folds of original filters inside it.
+    ///
+    /// A transformation belongs to the first scope whose walk reaches it,
+    /// enclosing scopes walking first: the keys the braces start from,
+    /// produced outside them and read as their groups too, belong to the
+    /// enclosing scope.
+    fn scopes(&self, root: u64, originals: &BTreeSet<u64>) -> Result<Vec<Scope>, PlanError> {
+        let mut scopes: Vec<Scope> = Vec::new();
+        // Each root with the index of the scope enclosing it.
+        let mut roots = VecDeque::from([(root, None)]);
+        let mut parents = Vec::new();
+        let mut claimed = BTreeSet::new();
+        while let Some((root, parent)) = roots.pop_front() {
+            let mut transformations = BTreeSet::new();
+            let mut folds = BTreeSet::new();
+            let mut pending = vec![root];
+            while let Some(fp) = pending.pop() {
+                let Some(index) = self.producer(fp) else {
+                    continue;
+                };
+                if !claimed.insert(index) {
+                    continue;
+                }
+                transformations.insert(index);
+                let info = &self.transformation_infos[index];
+                if is_fold(info) {
+                    folds.insert(index);
+                }
+                let (left, right) = info.input_info_fp();
+                match info {
+                    TransformationInfo::KVToKV { .. }
+                    | TransformationInfo::JoinToKV { .. }
+                    | TransformationInfo::AntiJoinToKV { .. } => {
+                        pending.push(left);
+                        pending.extend(right);
+                    }
+                    // The groups are read from this scope's keys; the
+                    // matches are a scope of their own.
+                    TransformationInfo::AggregateToKV { .. } => {
+                        roots.push_back((left, Some(scopes.len())));
+                        pending.extend(right);
+                    }
+                }
+            }
+            let filters = folds
+                .into_iter()
+                .filter(|&index| {
+                    let (left, _) = self.transformation_infos[index].input_info_fp();
+                    self.is_narrowed_original(left, originals)
+                })
+                .map(|index| self.folded_filter(index))
+                .collect::<Result<_, _>>()?;
+            parents.push(parent);
+            scopes.push(Scope {
+                root,
+                transformations,
+                filters,
+            });
+        }
+        // A scope's walk may enter the scopes nested in it. Every scope
+        // follows its enclosing one, so a nested scope is complete when
+        // it is added to its parent.
+        for child in (0..scopes.len()).rev() {
+            if let Some(parent) = parents[child] {
+                let nested = scopes[child].transformations.clone();
+                scopes[parent].transformations.extend(nested);
+            }
+        }
+        Ok(scopes)
+    }
+
+    /// The collections folded as filters anywhere in the plan, original
+    /// or not.
+    fn folded_filters(&self) -> BTreeSet<u64> {
+        self.transformation_infos
+            .iter()
+            .filter(|info| is_fold(info))
+            .map(|info| info.input_info_fp().0)
+            .collect()
+    }
+}
+
+/// Returns `true` if `info` folds a filter: it is a semijoin, a join whose
+/// left input holds keys alone, or an antijoin. The steps build no other
+/// join with a keys-only left input, since an atom whose variables another
+/// covers folds before any join is chosen.
+fn is_fold(info: &TransformationInfo) -> bool {
+    match info {
+        TransformationInfo::JoinToKV {
+            left_input_kv_layout,
+            ..
+        } => left_input_kv_layout.value().is_empty(),
+        TransformationInfo::AntiJoinToKV { .. } => true,
+        TransformationInfo::KVToKV { .. } | TransformationInfo::AggregateToKV { .. } => false,
     }
 }
 
@@ -242,22 +390,14 @@ impl RulePlanner {
 // Walk
 // =========================================================================
 impl RulePlanner {
-    /// Describes the filter with collection fingerprint `fp` from the
-    /// semijoin or antijoin that first applied it, naming its columns as
-    /// that application does.
+    /// Describes the filter the semijoin or antijoin at index `applied`
+    /// folded, naming its columns as that application does.
     ///
-    /// Returns an internal error if no transformation applies the filter,
-    /// or if one of the application's key columns has no variable name.
-    fn folded_filter(&self, fp: u64) -> Result<Filter, PlanError> {
-        let applied = self
-            .transformation_infos
-            .iter()
-            .find(|tx| matches!(tx.input_info_fp(), (left, Some(_)) if left == fp))
-            .ok_or_else(|| {
-                PlanError::internal(format!(
-                    "pushdown: folded filter {fp:#018x} has no semijoin or antijoin"
-                ))
-            })?;
+    /// Returns an internal error if one of the application's key columns
+    /// has no variable name.
+    fn folded_filter(&self, applied: usize) -> Result<Filter, PlanError> {
+        let applied = &self.transformation_infos[applied];
+        let (fp, _) = applied.input_info_fp();
         let name = applied.input_name().0.to_string();
         let layout = applied.input_kv_layout().0.clone();
         let key_names = layout
@@ -309,7 +449,7 @@ impl RulePlanner {
         fp: u64,
         view: &View,
         enforced: bool,
-        originals: &BTreeSet<u64>,
+        walk: &Walk<'_>,
     ) -> Result<bool, PlanError> {
         if fp == filter.fp || !view.covers(filter) {
             return Ok(false);
@@ -333,6 +473,14 @@ impl RulePlanner {
                 (vec![(Side::Left, false), (Side::Right, semijoin)], true)
             }
             TransformationInfo::AntiJoinToKV { .. } => (vec![(Side::Right, true)], true),
+            // The matches are the retained side: every answer's key is a
+            // group's, so a filter the groups carry holds for the matches.
+            // The groups take no copy; the keys they are read from carry
+            // every fold of the enclosing scope already.
+            TransformationInfo::AggregateToKV {
+                groups_input_info_fp,
+                ..
+            } => (vec![(Side::Left, true)], groups_input_info_fp.is_some()),
         };
 
         let mut descended = false;
@@ -347,6 +495,12 @@ impl RulePlanner {
                 continue;
             }
             descended = true;
+            // A collection the scope does not produce, the keys its braces
+            // start from, is a leaf the walk has looked into: nothing of
+            // it takes a copy, and none belongs above this node for it.
+            if !walk.transformations.contains(&target) {
+                continue;
+            }
             // Computed now rather than up front: when both inputs of a join
             // cover the filter and neither carries it, the copies added
             // under the first are what make a copy under the second
@@ -356,7 +510,7 @@ impl RulePlanner {
                     let (sibling, sibling_view) = self.input(index, side.other())?;
                     self.carries(sibling, filter) && sibling_view.covers(filter)
                 });
-            if !self.push_into(filter, child, &child_view, child_enforced, originals)? {
+            if !self.push_into(filter, child, &child_view, child_enforced, walk)? {
                 continue;
             }
             // Inside a chain of maps the copy climbs to the join that reads
@@ -364,7 +518,7 @@ impl RulePlanner {
             if !binary {
                 return Ok(true);
             }
-            self.land(filter, target, index, &child_view, originals)?;
+            self.land(filter, target, index, &child_view, walk)?;
         }
         Ok(!descended && !enforced)
     }
@@ -379,18 +533,19 @@ impl RulePlanner {
         target: usize,
         reader: usize,
         view: &View,
-        originals: &BTreeSet<u64>,
+        walk: &Walk<'_>,
     ) -> Result<(), PlanError> {
         let fp = self.transformation_infos[target].output_info_fp();
         // Fuse arranges each producer by one key layout. The copy takes
         // over `reader`'s read of the output, so its readers must not
         // outnumber its producers afterwards either. A folded filter is
-        // read by all of its columns everywhere and takes no copy.
+        // read by all of its columns everywhere and takes no copy, whether
+        // or not it is an original one.
         let (producers, consumers) = &self.producer_consumer[&fp];
-        if self.folded_filters.contains(&fp) || consumers.len() > producers.len() {
+        if walk.folded_filters.contains(&fp) || consumers.len() > producers.len() {
             return Ok(());
         }
-        self.insert_copy(filter, target, reader, view, originals)
+        self.insert_copy(filter, target, reader, view, walk.originals)
     }
 
     /// The input of transformation `index` on `side`: its fingerprint and
@@ -429,7 +584,9 @@ impl RulePlanner {
             TransformationInfo::KVToKV { input_info_fp, .. } => {
                 self.is_narrowed_original(*input_info_fp, originals)
             }
-            TransformationInfo::JoinToKV { .. } | TransformationInfo::AntiJoinToKV { .. } => false,
+            TransformationInfo::JoinToKV { .. }
+            | TransformationInfo::AntiJoinToKV { .. }
+            | TransformationInfo::AggregateToKV { .. } => false,
         }
     }
 
@@ -471,6 +628,11 @@ impl RulePlanner {
                     }
                     pending.extend(right);
                 }
+                // Every answer's key is a group's, so the answers carry
+                // what the groups do. The matches are left out: a group
+                // with no match is answered too, and no fold inside the
+                // braces holds for it.
+                TransformationInfo::AggregateToKV { .. } => pending.extend(right),
             }
         }
         false
@@ -483,7 +645,9 @@ impl RulePlanner {
 impl RulePlanner {
     /// Inserts a copy of `filter` between the output of transformation
     /// `index` and its reader `parent`, which sees that output as `view`:
-    /// the copy reads the output, and `parent` reads the copy instead.
+    /// the copy reads the output, and `parent` reads the copy instead. The
+    /// copy numbers the atoms of its two inputs apart, whatever the fold
+    /// and the reader numbered them.
     ///
     /// Returns an internal error if `view` does not name every variable of
     /// the filter.
@@ -523,7 +687,7 @@ impl RulePlanner {
             .filter(|position| !keys.contains(position))
             .cloned()
             .collect();
-        let variables: BTreeMap<AtomArgumentSignature, String> = view
+        let variables: BTreeMap<AtomArgumentSignature, Variable> = view
             .positions
             .iter()
             .zip(&view.names)
@@ -533,6 +697,34 @@ impl RulePlanner {
             })
             .collect();
         let retained = KeyValueLayout::new(keys, values);
+        // A copy is the one join built outside the catalog: the filter's
+        // layout keeps the atom number its fold gave it and the target's
+        // positions the one their reader gave the target, and nothing kept
+        // the two apart. The copy numbers the filter as the atom after the
+        // target's, as a fold would number the filter had the rule listed
+        // it right after the target. Fuse and codegen address columns by
+        // argument id, which the renumbering keeps.
+        let next = view
+            .positions
+            .iter()
+            .flat_map(ArithmeticPos::signatures)
+            .map(|signature| signature.atom_signature().rhs_id() + 1)
+            .max()
+            .unwrap_or(0);
+        let keys = filter
+            .layout
+            .key()
+            .iter()
+            .map(|position| {
+                position.map_vars(&|signature| {
+                    FactorPos::Var(AtomArgumentSignature::new(
+                        AtomSignature::new(signature.atom_signature().is_positive(), next),
+                        signature.argument_id(),
+                    ))
+                })
+            })
+            .collect();
+        let arranged = KeyValueLayout::new(keys, Vec::new());
         // `parent` addresses the columns by index, so the copy keeps the
         // target's column order and key/value split; only the arrangement
         // the copy joins on puts the filter's variables first.
@@ -547,7 +739,7 @@ impl RulePlanner {
                 target_fp,
                 target_name.clone(),
                 Self::semijoin_name(&filter.name, &target_name, &filter.key_names),
-                filter.layout.clone(),
+                arranged,
                 retained,
                 output,
                 JoinPredicates::default(),
@@ -559,7 +751,7 @@ impl RulePlanner {
                 target_fp,
                 target_name.clone(),
                 Self::antijoin_name(&filter.name, &target_name, &filter.key_names),
-                filter.layout.clone(),
+                arranged,
                 retained,
                 output,
             )
@@ -568,7 +760,7 @@ impl RulePlanner {
         let copy_fp = tx.output_info_fp();
         trace!("Pushdown transformation:\n{tx}");
         // Appended out of pipeline order: the filter's producer may sit
-        // after the target when core folded the filter late. `pushdown`
+        // after the target when a step folded the filter late. `pushdown`
         // restores the order once every copy is in. The walk itself reads
         // the producer-consumer map, rebuilt here, never the list order.
         self.transformation_infos.push(tx);
@@ -618,15 +810,17 @@ impl RulePlanner {
 // =============================================================================
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::test_harness::rule_planner;
 
-    /// Plans `src` through prepare, core in body order, and pushdown.
+    /// Plans `src` through prepare, joins in body order, and pushdown.
     fn plan(src: &str) -> RulePlanner {
         let (mut planner, mut catalog) = rule_planner(src);
         planner.prepare(&mut catalog).unwrap();
         while !catalog.is_planned() {
-            planner.core(&mut catalog, (0, 1)).unwrap();
+            planner.join(&mut catalog, (0, 1)).unwrap();
         }
         planner.pushdown(&catalog).unwrap();
         planner
@@ -663,7 +857,11 @@ mod tests {
         assert!(matches!(copies[0], TransformationInfo::JoinToKV { .. }));
         assert_eq!(
             copies[0].output_variables(),
-            vec![Some("x"), Some("z"), Some("v")]
+            vec![
+                Some(&Variable::from("x")),
+                Some(&Variable::from("z")),
+                Some(&Variable::from("v"))
+            ]
         );
         let join = binary(&planner, "c", "d");
         assert_eq!(join.len(), 1);
@@ -730,8 +928,8 @@ mod tests {
         assert!(matches!(copies[0], TransformationInfo::AntiJoinToKV { .. }));
     }
 
-    /// `F(x, z)` spans the join of `A` and `B`, so core folds it on the join
-    /// output and no leaf can take a copy.
+    /// `F(x, z)` spans the join of `A` and `B`, so the join step folds it
+    /// on the join output and no leaf can take a copy.
     #[test]
     fn spanning_filter_stays_on_the_join() {
         let planner = plan(
@@ -899,5 +1097,106 @@ mod tests {
             .filter(|tx| matches!(tx, TransformationInfo::AntiJoinToKV { .. }))
             .count();
         assert_eq!(antijoins, 1, "only the fold of `!U`");
+    }
+
+    /// `A(x, "p", p)` and `A(x, "k", k)` fold to `x` and fold into one
+    /// another, as does the third atom that keeps only `x`. A copy of one
+    /// onto another's chain would make each read the other, so none lands
+    /// there; the one copy that does land is of `A(x, "p", p)` onto
+    /// `A(x, "r", r)`, which folds nowhere. Naming the unused `p` and `k`
+    /// keeps a projection above each constant filter, so each chain has an
+    /// inside (issue #411: copies on the leaves of two folded filters'
+    /// chains formed a cycle; issue #410: a copy under the projection of
+    /// one left fuse merging that projection into a copy).
+    // Cases: rule, (the number of folds plus the copy).
+    #[rstest]
+    #[case::filtered(
+        "V(x) :- P(x, \"a\", \"b\", \"c\"), A(x, \"r\", r), A(x, \"p\", p), A(x, \"k\", k), \
+         R(x, r, \"u\", u).",
+        5
+    )]
+    #[case::unary(
+        "V(x) :- S(x), A(x, \"r\", r), A(x, \"p\", p), A(x, \"k\", k), R(x, r, _, u).",
+        5
+    )]
+    fn folded_filters_take_no_copies_of_each_other(#[case] rule: &str, #[case] expected: usize) {
+        let planner = plan(&format!(
+            ".decl P(x: symbol, t: symbol, k: symbol, d: symbol)\n.input P\n\
+             .decl S(x: symbol)\n.input S\n\
+             .decl A(x: symbol, k: symbol, v: symbol)\n.input A\n\
+             .decl R(x: symbol, r: symbol, k: symbol, v: symbol)\n.input R\n\
+             .decl V(x: symbol)\n.output V\n{rule}\n"
+        ));
+
+        let infos = planner.transformation_infos();
+        let folded = planner.folded_filters();
+        // A folded filter and every map in the chain under it.
+        let mut chains = std::collections::BTreeSet::new();
+        for &filter in &folded {
+            let mut fp = filter;
+            chains.insert(fp);
+            while let Some(index) = planner.producer(fp) {
+                let TransformationInfo::KVToKV { input_info_fp, .. } = &infos[index] else {
+                    break;
+                };
+                fp = *input_info_fp;
+                chains.insert(fp);
+            }
+        }
+        let mut applications = 0;
+        for tx in infos {
+            let (filter, Some(target)) = tx.input_info_fp() else {
+                continue;
+            };
+            if !folded.contains(&filter) {
+                continue;
+            }
+            applications += 1;
+            assert!(
+                !chains.contains(&target),
+                "{} applies a folded filter inside another's chain",
+                tx.output_name()
+            );
+        }
+        assert_eq!(
+            applications, expected,
+            "the joins that fold a filter, and the copy onto `A(x, \"r\", r)`"
+        );
+    }
+
+    /// `!A(x, "n", _)` folds onto `A(x, "p", p)` under the projection
+    /// that keeps `x`, so the copy of `S` lands on the positive side of
+    /// that antijoin. The antijoin numbers that side atom 0, as `S`'s fold
+    /// numbers `S`; the copy numbers `S` past it, or canonical form could
+    /// not tell the two inputs apart (issue #410).
+    #[test]
+    fn copy_onto_an_antijoin_fold_tells_its_inputs_apart() {
+        let planner = plan(
+            ".decl S(x: symbol)\n.input S\n\
+             .decl A(x: symbol, k: symbol, v: symbol)\n.input A\n\
+             .decl R(x: symbol, r: symbol, k: symbol, v: symbol)\n.input R\n\
+             .decl V(x: symbol)\n.output V\n\
+             V(x) :- S(x), A(x, \"r\", r), A(x, \"p\", p), A(x, \"k\", k), !A(x, \"n\", _), \
+             R(x, r, _, u).\n",
+        );
+
+        let atoms = |layout: &KeyValueLayout| -> BTreeSet<AtomSignature> {
+            layout
+                .key()
+                .iter()
+                .chain(layout.value())
+                .flat_map(ArithmeticPos::signatures)
+                .map(|signature| *signature.atom_signature())
+                .collect()
+        };
+        let copy = binary(&planner, "s", "π[x,p](a)");
+        assert_eq!(copy.len(), 1, "the copy of `S` onto `A(x, \"p\", p)`");
+        let (left, Some(right)) = copy[0].input_kv_layout() else {
+            panic!("a copy reads two inputs");
+        };
+        assert!(
+            atoms(left).is_disjoint(&atoms(right)),
+            "the copy numbers an atom of both inputs alike: {left} and {right}"
+        );
     }
 }

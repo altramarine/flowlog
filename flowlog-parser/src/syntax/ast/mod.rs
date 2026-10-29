@@ -3,14 +3,25 @@
 //! ```text
 //! FlowLogRule (rule)
 //! |-- Head (head)
-//! |   `-- HeadArg: Var | Arith(Arithmetic) | Aggregation (aggregation)
+//! |   `-- HeadArg: Var(Variable) (variable) | Arith(Arithmetic)
 //! `-- body: Predicate list (predicate)
 //!     |-- PositiveAtom / NegativeAtom: Atom (atom)
-//!     |   `-- AtomArg: Var | Const(Constant) (constant) | Placeholder
-//!     `-- Compare: ComparisonExpr (comparison)
-//!         `-- Arithmetic (arithmetic)
-//!             `-- Factor: Var | Const(Constant) | FnCall (fn_call) | Builtin (builtin) | Cast (cast) | Group | Tuple (tuple) | TupleProj
+//!     |   `-- AtomArg: Var(Variable) | Const(Constant) (constant)
+//!     |               | Placeholder
+//!     |-- Compare: ComparisonExpr (comparison)
+//!     |   `-- Arithmetic (arithmetic)
+//!     |       `-- Factor: Var(Variable) | Const(Constant) | FnCall (fn_call)
+//!     |               | Builtin (builtin) | Cast (cast) | Group
+//!     |               | Tuple | Placeholder | TupleProj
+//!     |               | Aggregate(AggregateExpr)
+//!     `-- Aggregate: AggregateExpr (aggregation), binding its var
+//!         |-- target: Arithmetic
+//!         `-- body: Predicate list
 //! ```
+//!
+//! `Factor::Aggregate` and `Factor::Placeholder` are surface syntax: rule
+//! construction hoists each aggregate into a `Predicate::Aggregate`
+//! binding and names each `_` as an anonymous variable.
 //!
 //! `plan` holds the `.plan` directive machinery (no AST node of its own).
 
@@ -25,10 +36,10 @@ mod fn_call;
 mod head;
 mod predicate;
 mod rule;
-mod tuple;
+mod variable;
 
 // Re-exported at the crate root for the downstream pipeline crates.
-pub use aggregation::Aggregation;
+pub use aggregation::AggregateExpr;
 pub use aggregation::AggregationOperator;
 pub use arithmetic::Arithmetic;
 pub use arithmetic::ArithmeticOperator;
@@ -38,6 +49,7 @@ pub use atom::AtomArg;
 pub use builtin::BuiltinCall;
 pub use builtin::BuiltinOperator;
 pub use cast::Cast;
+pub(crate) use cast::CastTarget;
 pub use comparison::ComparisonExpr;
 pub use comparison::ComparisonOperator;
 pub use constant::Constant;
@@ -46,5 +58,4 @@ pub use head::Head;
 pub use head::HeadArg;
 pub use predicate::Predicate;
 pub use rule::FlowLogRule;
-pub use tuple::TupleElem;
-pub use tuple::TupleLit;
+pub use variable::Variable;

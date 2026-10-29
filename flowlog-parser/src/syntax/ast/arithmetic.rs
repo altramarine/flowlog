@@ -12,12 +12,13 @@ use std::fmt;
 use educe::Educe;
 use flowlog_common::Span;
 
+use super::AggregateExpr;
 use super::BuiltinCall;
 use super::BuiltinOperator;
 use super::Cast;
 use super::Constant;
 use super::FnCall;
-use super::tuple::TupleLit;
+use super::Variable;
 use crate::Lexeme;
 use crate::Node;
 use crate::Rule;
@@ -30,10 +31,7 @@ use crate::error::grammar_bug;
 
 /// Binary arithmetic operators in value expressions.
 ///
-/// The bitwise operators and `^` follow Souffle: the shifts mask their
-/// count to the operand width, `bshr` extends the sign and `bshru` fills
-/// with zeros, and integer `^` wraps on overflow and yields `0` for a
-/// negative exponent. Those rules live in the runtime's `arith` module.
+/// The runtime's `arith` module defines what each operator computes.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ArithmeticOperator {
     Plus,
@@ -165,7 +163,7 @@ impl Lexeme for ArithmeticOperator {
 /// distinct so downstream stages match on the node type, not on a name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Factor {
-    Var(String),
+    Var(Variable),
     Const(Constant),
     /// User `.extern fn` call.
     FnCall(FnCall),
@@ -177,15 +175,26 @@ pub enum Factor {
     /// Always multi-term at parse time: single-factor expressions like
     /// `(x)` collapse to the bare factor.
     Group(Box<Arithmetic>),
-    /// `(e0, e1, ...)` tuple literal.
-    Tuple(TupleLit),
-    /// Projection of component `index` out of `tuple`. Synthesized by the
-    /// destructure desugar; it has no surface syntax and appears only
-    /// after desugaring.
+    /// `(e0, e1, ...)`: builds a tuple from its fields, which may be
+    /// tuples. A one-field tuple is spelled `(e0,)`, the trailing comma
+    /// telling it from the grouped `(e0)`.
+    Tuple(Vec<Arithmetic>),
+    /// `(tuple).index`: reads one field out of a tuple, the inverse of
+    /// [`Factor::Tuple`]. It has no surface syntax yet: assignment
+    /// substitution makes one per field when it lowers a destructure,
+    /// `(a, _) = p` giving `a` the value `(p).0`.
     TupleProj {
         tuple: Box<Arithmetic>,
         index: usize,
     },
+    /// `_`, a field of a tuple literal. Surface syntax only: rule
+    /// construction replaces each by a fresh anonymous variable
+    /// ([`Arithmetic::name_placeholders`]), so no rule holds one.
+    Placeholder,
+    /// `op target : { body }`. Surface syntax only: rule lowering hoists
+    /// every aggregate into a [`Predicate::Aggregate`](super::Predicate)
+    /// binding, so no rule holds one.
+    Aggregate(Box<AggregateExpr>),
 }
 
 impl Factor {
@@ -200,7 +209,9 @@ impl Factor {
             | Self::Cast(_)
             | Self::Group(_)
             | Self::Tuple(_)
-            | Self::TupleProj { .. } => false,
+            | Self::Placeholder
+            | Self::TupleProj { .. }
+            | Self::Aggregate(_) => false,
         }
     }
 
@@ -215,22 +226,85 @@ impl Factor {
             | Self::Cast(_)
             | Self::Group(_)
             | Self::Tuple(_)
-            | Self::TupleProj { .. } => false,
+            | Self::Placeholder
+            | Self::TupleProj { .. }
+            | Self::Aggregate(_) => false,
         }
     }
 
     /// Variables in order of appearance, including repeated occurrences.
+    /// An aggregate contributes none: its variables belong to its own body,
+    /// which rule lowering separates from the rule.
     #[must_use]
-    pub fn vars(&self) -> Vec<&String> {
+    pub fn vars(&self) -> Vec<&Variable> {
         match self {
             Self::Var(v) => vec![v],
-            Self::Const(_) => vec![],
+            Self::Const(_) | Self::Placeholder => vec![],
             Self::FnCall(fc) => fc.vars(),
             Self::Builtin(bc) => bc.vars(),
             Self::Cast(c) => c.inner().vars(),
             Self::Group(a) => a.vars(),
-            Self::Tuple(r) => r.vars(),
+            Self::Tuple(fields) => fields.iter().flat_map(Arithmetic::vars).collect(),
             Self::TupleProj { tuple, .. } => tuple.vars(),
+            Self::Aggregate(_) => vec![],
+        }
+    }
+
+    /// Replaces each aggregate in this factor by `Var(bind(aggregate))`.
+    fn hoist_aggregates(&mut self, bind: &mut impl FnMut(AggregateExpr) -> Variable) {
+        match self {
+            Self::Var(_) | Self::Const(_) | Self::Placeholder => {}
+            Self::FnCall(fc) => fc
+                .args_mut()
+                .iter_mut()
+                .for_each(|a| a.hoist_aggregates(bind)),
+            Self::Builtin(bc) => bc
+                .args_mut()
+                .iter_mut()
+                .for_each(|a| a.hoist_aggregates(bind)),
+            Self::Cast(c) => c.inner_mut().hoist_aggregates(bind),
+            Self::Group(a) | Self::TupleProj { tuple: a, .. } => a.hoist_aggregates(bind),
+            Self::Tuple(fields) => {
+                for a in fields {
+                    a.hoist_aggregates(bind);
+                }
+            }
+            Self::Aggregate(agg) => {
+                let name = bind(AggregateExpr::clone(agg));
+                *self = Self::Var(name);
+            }
+        }
+    }
+
+    /// Replaces each `_` in this factor by `Var(Variable::Anonymous(next))`,
+    /// counting `next` up, in source order.
+    fn name_placeholders(&mut self, next: &mut usize) {
+        match self {
+            Self::Var(_) | Self::Const(_) => {}
+            Self::FnCall(fc) => {
+                for a in fc.args_mut() {
+                    a.name_placeholders(next);
+                }
+            }
+            Self::Builtin(bc) => {
+                for a in bc.args_mut() {
+                    a.name_placeholders(next);
+                }
+            }
+            Self::Cast(c) => c.inner_mut().name_placeholders(next),
+            Self::Group(a) | Self::TupleProj { tuple: a, .. } => a.name_placeholders(next),
+            Self::Tuple(fields) => {
+                for a in fields {
+                    a.name_placeholders(next);
+                }
+            }
+            Self::Placeholder => {
+                *self = Self::Var(Variable::Anonymous(*next));
+                *next += 1;
+            }
+            // Rule construction hoists aggregates before it names
+            // placeholders, so none is left to look into.
+            Self::Aggregate(_) => {}
         }
     }
 }
@@ -244,8 +318,23 @@ impl fmt::Display for Factor {
             Self::Builtin(bc) => write!(f, "{bc}"),
             Self::Cast(c) => write!(f, "{c}"),
             Self::Group(a) => write!(f, "({a})"),
-            Self::Tuple(r) => write!(f, "{r}"),
+            // Source form: a one-field tuple keeps the trailing comma that
+            // tells `(x,)` from the grouped `(x)`.
+            Self::Tuple(fields) => {
+                let inner = fields
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if fields.len() == 1 {
+                    write!(f, "({inner},)")
+                } else {
+                    write!(f, "({inner})")
+                }
+            }
+            Self::Placeholder => write!(f, "_"),
             Self::TupleProj { tuple, index } => write!(f, "({tuple}).{index}"),
+            Self::Aggregate(agg) => write!(f, "{agg}"),
         }
     }
 }
@@ -256,9 +345,10 @@ impl Lexeme for Factor {
         Ok(match inner.rule() {
             Rule::as_cast => Self::Cast(Box::new(inner.lower()?)),
             Rule::call_expr => parse_call_expr(inner)?,
-            Rule::variable => Self::Var(inner.text().to_string()),
+            Rule::variable => Self::Var(inner.text().into()),
             Rule::constant => Self::Const(inner.lower()?),
             Rule::paren_factor => parse_paren_factor(inner)?,
+            Rule::aggregate_expr => Self::Aggregate(Box::new(inner.lower()?)),
             other => return Err(grammar_bug(format!("invalid factor rule: {other:?}"))),
         })
     }
@@ -312,12 +402,11 @@ fn parse_paren_factor(mut node: Node) -> Result<Factor, ParseError> {
         let trailing_comma = children.take_if(Rule::trailing_comma).is_some();
         if trailing_comma || elements.peek().is_some() {
             // A trailing comma makes `(x,)` a tuple even with one field.
-            // Tuple elements own their expression-or-placeholder validation.
             let fields = std::iter::once(first)
                 .chain(elements)
-                .map(Node::lower)
+                .map(parse_tuple_field)
                 .collect::<Result<_, _>>()?;
-            return Ok(Factor::Tuple(TupleLit::new(fields, span)));
+            return Ok(Factor::Tuple(fields));
         }
 
         // A comma-free item must be a value. The shared grammar also admits
@@ -349,6 +438,30 @@ fn parse_paren_factor(mut node: Node) -> Result<Factor, ParseError> {
         }
         let expr: Arithmetic = value.lower()?;
         return Ok(expr.into_factor());
+    }
+}
+
+/// Lowers one `paren_item` as a tuple field: an expression, or a `_`. The
+/// shared grammar also admits a condition there, which is rejected.
+fn parse_tuple_field(node: Node) -> Result<Arithmetic, ParseError> {
+    let span = node.span();
+    let not_a_value = || ParseError::Syntax {
+        span,
+        message: "expected a value expression".into(),
+    };
+    let mut parts = node.children();
+    let value = parts.next_any("tuple field")?;
+    if parts.next().is_some() {
+        return Err(not_a_value());
+    }
+    match value.rule() {
+        Rule::arithmetic_expr => value.lower(),
+        Rule::placeholder => Ok(Arithmetic {
+            init: Factor::Placeholder,
+            rest: vec![],
+            span: value.span(),
+        }),
+        _ => Err(not_a_value()),
     }
 }
 
@@ -407,8 +520,8 @@ impl Arithmetic {
 
     /// A bare variable as an expression: `Factor::Var(name)` with no operators.
     #[must_use]
-    pub(crate) fn var(name: &str) -> Self {
-        Self::new(Factor::Var(name.to_string()), vec![])
+    pub(crate) fn var(var: impl Into<Variable>) -> Self {
+        Self::new(Factor::Var(var.into()), vec![])
     }
 
     /// Source location this expression was parsed from (`Span::DUMMY` for
@@ -435,23 +548,43 @@ impl Arithmetic {
         &mut self.init
     }
 
-    pub(crate) fn rest_mut(&mut self) -> &mut [(ArithmeticOperator, Factor)] {
-        &mut self.rest
+    /// Every factor in source order, `init` first, without the operators
+    /// between them.
+    pub fn factors(&self) -> impl Iterator<Item = &Factor> {
+        std::iter::once(&self.init).chain(self.rest.iter().map(|(_, factor)| factor))
+    }
+
+    pub(crate) fn factors_mut(&mut self) -> impl Iterator<Item = &mut Factor> {
+        std::iter::once(&mut self.init).chain(self.rest.iter_mut().map(|(_, factor)| factor))
+    }
+
+    /// The fields of the tuple literal this expression consists of, when
+    /// it is a lone one with no operators.
+    #[must_use]
+    pub fn as_tuple(&self) -> Option<&[Arithmetic]> {
+        let Factor::Tuple(fields) = &self.init else {
+            return None;
+        };
+        self.rest.is_empty().then_some(fields)
+    }
+
+    /// Replaces each `_` in this expression, in source order, by
+    /// `Variable::Anonymous(next)`, counting `next` up.
+    pub(crate) fn name_placeholders(&mut self, next: &mut usize) {
+        for factor in self.factors_mut() {
+            factor.name_placeholders(next);
+        }
     }
 
     /// Variables in order of appearance (duplicates preserved).
     #[must_use]
-    pub fn vars(&self) -> Vec<&String> {
-        let mut out = self.init.vars();
-        for (_, f) in &self.rest {
-            out.extend(f.vars());
-        }
-        out
+    pub fn vars(&self) -> Vec<&Variable> {
+        self.factors().flat_map(Factor::vars).collect()
     }
 
     /// Unique variables (deduplicated).
     #[must_use]
-    pub fn vars_set(&self) -> HashSet<&String> {
+    pub fn vars_set(&self) -> HashSet<&Variable> {
         self.vars().into_iter().collect()
     }
 
@@ -465,6 +598,14 @@ impl Arithmetic {
     #[must_use]
     pub fn is_var(&self) -> bool {
         self.rest.is_empty() && self.init.is_var()
+    }
+
+    /// Replaces each aggregate in this expression, in source order, by a
+    /// variable: the name `bind` returns for it.
+    pub(crate) fn hoist_aggregates(&mut self, bind: &mut impl FnMut(AggregateExpr) -> Variable) {
+        for factor in self.factors_mut() {
+            factor.hoist_aggregates(bind);
+        }
     }
 }
 
@@ -632,7 +773,7 @@ mod tests {
     fn prefixed_factor_preserves_variable_name(#[case] src: &str) {
         assert_eq!(
             parse_node::<Factor>(Rule::factor, src),
-            Factor::Var(src.to_string())
+            Factor::Var(src.into())
         );
     }
 
@@ -665,8 +806,12 @@ mod tests {
     #[test]
     fn vars_set_contains_each_variable_once() {
         let expr: Arithmetic = parse_node(Rule::arithmetic_expr, "x + x + y");
-        let vars: HashSet<_> = expr.vars_set().into_iter().map(String::as_str).collect();
-        assert_eq!(vars, HashSet::from(["x", "y"]));
+        let vars: HashSet<String> = expr
+            .vars_set()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(vars, HashSet::from(["x".to_string(), "y".to_string()]));
     }
 
     #[rstest]
@@ -887,6 +1032,9 @@ mod tests {
     #[case("as(x, uint32)", "cast")]
     #[case("(a, b)", "tuple")]
     #[case("(a + b)", "group")]
+    #[case("count : R(x)", "aggregate")]
+    #[case("counter", "var")]
+    #[case("min_x", "var")]
     fn factor_parses_each_variant(#[case] src: &str, #[case] expected: &str) {
         let kind = match parse_node::<Factor>(Rule::factor, src) {
             Factor::Var(_) => "var",
@@ -896,7 +1044,9 @@ mod tests {
             Factor::Cast(_) => "cast",
             Factor::Group(_) => "group",
             Factor::Tuple(_) => "tuple",
+            Factor::Placeholder => "placeholder",
             Factor::TupleProj { .. } => "tupleproj",
+            Factor::Aggregate(_) => "aggregate",
         };
         assert_eq!(kind, expected, "src={src}");
     }
@@ -950,5 +1100,51 @@ mod tests {
         // The head's closing delimiter prevents accepting only the `x` prefix.
         let err = FlowLogParser::parse(Rule::head, "C(x cat y)").unwrap_err();
         assert!(matches!(err.variant, ErrorVariant::ParsingError { .. }));
+    }
+
+    // Cases: source, is a tuple literal.
+    #[rstest]
+    #[case("(x, y)", true)]
+    #[case("(x,)", true)]
+    #[case("(x)", false)]
+    #[case("(x, y) + 1", false)]
+    fn as_tuple_is_the_lone_tuple_literal(#[case] source: &str, #[case] is_tuple: bool) {
+        let a: Arithmetic = parse_node(Rule::arithmetic_expr, source);
+        assert_eq!(a.as_tuple().is_some(), is_tuple);
+    }
+
+    /// A tuple field is a value or a `_`, never a condition.
+    // Cases: source, invalid field.
+    #[rstest]
+    #[case("(x > 0, y)", "x > 0")]
+    #[case("(y, !R(x))", "!R(x)")]
+    #[case("(!match(x, y),)", "!match(x, y)")]
+    fn tuple_fields_reject_conditions(#[case] src: &str, #[case] invalid: &str) {
+        let node = Node::new(parse_pair(Rule::factor, src), FileId::new(0));
+        assert_err!(
+            node.lower::<Factor>(),
+            ParseError::Syntax { span, message }
+                if &src[span.range()] == invalid && message == "expected a value expression"
+        );
+    }
+
+    /// Each `_` becomes its own anonymous variable, numbered in source
+    /// order across nesting, and still prints as `_`.
+    #[test]
+    fn placeholders_are_named_in_source_order() {
+        let mut a: Arithmetic = parse_node(Rule::arithmetic_expr, "((_, x), _) + (_,)");
+        let mut next = 0;
+        a.name_placeholders(&mut next);
+        assert_eq!(next, 3);
+        assert_eq!(
+            a.vars(),
+            [
+                &Variable::Anonymous(0),
+                &Variable::from("x"),
+                &Variable::Anonymous(1),
+                &Variable::Anonymous(2)
+            ]
+        );
+        assert_eq!(a.to_string(), "((_, x), _) + (_,)");
     }
 }
