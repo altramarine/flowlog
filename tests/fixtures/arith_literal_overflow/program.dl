@@ -1,0 +1,13 @@
+// ============================================================================
+// Suite   : arith_literal_overflow
+// Feature : arithmetic on literals that overflows
+// Covers  : the generated crate builds it (issue #473: rustc rejected it),
+//           and it runs as over variables: `2147483647 + 1` wraps
+// ============================================================================
+
+.decl K(x: int32)
+.input K(IO="file", filename="K.csv", delimiter=",")
+
+.decl Wrapped(v: int32)
+Wrapped(2147483647 + 1) :- K(_).
+.output Wrapped

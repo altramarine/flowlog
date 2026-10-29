@@ -15,11 +15,16 @@ pub(crate) fn gen_imports(config: &Config, program: &Program) -> TokenStream {
     let mut out = Vec::<TokenStream>::new();
 
     out.push(quote! {
+        // Relation names may begin with `_` (DOOP's `_MethodLookup_*`), and
         // joined with their component prefix they synthesize binding idents
         // with consecutive underscores, which `non_snake_case` rejects.
+        #![allow(non_snake_case)]
+        // A comparison the program writes is emitted as written, also one
+        // its column's type decides alone, such as `u >= 0` on a `uint64`,
+        // which always holds.
+        #![allow(unused_comparisons)]
         // Every other warning is a generator bug, and `-Dwarnings` keeps it
         // fatal (docs/dev/code.md rule 8).
-        #![allow(non_snake_case)]
 
         mod relation;
         use relation::*;
