@@ -1,0 +1,32 @@
+// ============================================================================
+// Suite   : agg_braces_read_outer_variable
+// Feature : counts whose braces read a variable bound outside them
+// Covers  : a filter on that variable; only maps read the collection of
+//           the outer atoms, the one taking the groups from it and the
+//           braces' filter, so it is written as rows and the generated crate
+//           binds no unread arrangement (issue #467), also when the outer
+//           atoms join and that join is a map over another rule's wider one
+// ============================================================================
+
+// Each count reads `d`, which `K` binds outside its braces, and answers 0
+// for a `d` the braces match nothing for.
+.decl K(d: int32)
+.input K(IO="file", filename="K.csv", delimiter=",")
+.decl T(a: int32)
+.input T(IO="file", filename="T.csv", delimiter=",")
+.decl J(d: int32, e: int32)
+.input J(IO="file", filename="J.csv", delimiter=",")
+
+.decl Filtered(d: int32, n: int32)
+Filtered(d, n) :- K(d), n = count : { T(a), d > 1 }.
+.output Filtered
+
+// `Joined` keeps `e`, so its join of `K` and `J` serves the narrower one
+// outside `Served`'s braces.
+.decl Joined(d: int32, e: int32)
+Joined(d, e) :- K(d), J(d, e).
+.output Joined
+
+.decl Served(d: int32, n: int32)
+Served(d, n) :- K(d), J(d, _), n = count : { T(a), d > 1 }.
+.output Served

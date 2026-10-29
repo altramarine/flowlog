@@ -50,8 +50,8 @@ impl StratumPlanner {
     /// Returns an internal error if the result has a cycle, or if a map
     /// the rule planner built reads a keyed collection. Neither happens:
     /// a map is only ever placed over a computed collection of the same
-    /// body, and fuse merges every map into its producer unless it reads
-    /// a relation.
+    /// body, and the rule planner writes a collection only maps read as
+    /// rows.
     pub(super) fn dedup_transformations(
         &mut self,
         preludes: &[Transformation],
@@ -162,8 +162,8 @@ impl StratumPlanner {
     /// # Errors
     ///
     /// Returns an internal error if a map this pass did not build reads a
-    /// keyed collection. The rule planner produces none: fuse merges every
-    /// map into its producer unless it reads a relation.
+    /// keyed collection. The rule planner produces none: it writes a
+    /// collection only maps read as rows.
     fn cover_bodies(&mut self, preludes: &[Transformation]) -> Result<(), PlanError> {
         let heads: HashSet<u64> = self.idb_to_heads_map.values().flatten().copied().collect();
         // Readers by input fingerprint, as indices into this stratum's own
