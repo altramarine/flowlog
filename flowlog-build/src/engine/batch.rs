@@ -148,6 +148,11 @@ fn gen_run_body(
 
     let staged_inputs = gen_staged_inputs(edbs);
     let inputs_new_args = edbs.iter().map(|rel| input_handle_ident(rel.name()));
+    // `gen_inputs_container` gives `Inputs::new` these parameters exactly
+    // when `has_inputs` holds, so the call asks the same question.
+    let coordinates = program
+        .has_inputs()
+        .then(|| quote! { worker.peers(), worker.index(), #uses_ord, });
     let typed_ingest = gen_typed_ingest(edbs);
     let drain_locals = gen_drain_blocks(program);
     let result_fields = gen_result_fields(program);
@@ -162,13 +167,12 @@ fn gen_run_body(
             #emitter_captures
 
             move |worker| {
-                let index = worker.index();
                 #worker_init
 
                 #dataflow
 
                 let mut inputs = Inputs::new(
-                    #(#inputs_new_args,)* worker.peers(), index, #uses_ord,
+                    #(#inputs_new_args,)* #coordinates
                 ).expect("invalid input worker coordinates");
                 #(#typed_ingest)*
                 inputs.apply_inline_all();
