@@ -8,6 +8,7 @@ use flowlog_profiler::PlanGraph;
 use crate::optimizer::Optimizer;
 use crate::planner::StratumPlanner;
 use crate::planner::Transformation;
+use crate::planner::arity_order;
 use crate::stratifier::Stratifier;
 
 /// Whole-program planning.
@@ -28,8 +29,9 @@ impl ProgramPlanner {
         let mut optimizer = Optimizer::new();
         let mut preludes: Vec<Transformation> = Vec::new();
         let mut strata = Vec::with_capacity(stratifier.strata().len());
+        let mut bound_relations = program.edb_fingerprints();
         for stratum in stratifier.strata() {
-            let planned = StratumPlanner::from_stratum(
+            let mut planned = StratumPlanner::from_stratum(
                 program,
                 stratum,
                 &mut optimizer,
@@ -37,10 +39,21 @@ impl ProgramPlanner {
                 &preludes,
             )
             .map_err(BoxError::from)?;
+            planned.bind_head_seeds(&bound_relations);
+            bound_relations.extend(planned.output_relations());
             preludes.extend(planned.non_recursive_transformations().iter().cloned());
             strata.push(planned);
         }
-        Ok(Self { strata })
+        // Finish logical sharing first, then optimize consumers before
+        // their producers so downstream plans define stratum boundaries.
+        let mut optimized = Vec::with_capacity(strata.len());
+        while let Some(stratum) = strata.pop() {
+            let stratum = arity_order::optimize(stratum, &strata, &optimized, program);
+            optimized.push(stratum);
+        }
+        // Evaluation still follows dependency order.
+        optimized.reverse();
+        Ok(Self { strata: optimized })
     }
 
     pub fn strata(&self) -> &[StratumPlanner] {
@@ -284,7 +297,7 @@ mod tests {
         let heads: Vec<u64> = pp
             .strata()
             .iter()
-            .flat_map(|s| s.idb_to_heads_map().values().flatten().copied())
+            .flat_map(|s| s.heads().values().flat_map(|head| head.inputs()).copied())
             .collect();
         assert_eq!(heads.len(), 2, "P and Q must each keep their own head");
         assert_ne!(

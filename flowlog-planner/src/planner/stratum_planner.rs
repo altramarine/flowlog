@@ -25,6 +25,10 @@ use crate::planner::Transformation;
 use crate::stratifier::Stratum;
 
 mod dedup;
+mod head;
+
+pub use head::HeadOperation;
+pub use head::HeadPlan;
 
 /// Planned transformations and execution metadata for one stratum.
 ///
@@ -59,11 +63,9 @@ pub struct StratumPlanner {
     /// Fingerprints of collections that exit recursion.
     recursion_leave_collections: Vec<u64>,
 
-    /// The collections whose rows each relation of this stratum unions:
-    /// one per rule as planned, fewer once sharing lets one collection
-    /// stand for several heads. Codegen concatenates them per relation,
-    /// and merges a lattice relation's union by its declared column.
-    idb_to_heads_map: HashMap<u64, Vec<u64>>,
+    /// The explicit head step of every relation, including its union
+    /// inputs and dedup order or declared aggregation.
+    pub(super) heads: HashMap<u64, HeadPlan>,
 
     /// Atom fingerprints unioned across every rule's rhs. Computed once at
     /// stratum construction so codegen can tell which transformation inputs
@@ -169,21 +171,31 @@ impl StratumPlanner {
             .collect();
         // Each rule's last transformation is its head; dedup rewrites the
         // map as it merges heads or serves one from another collection.
-        let mut idb_to_heads_map: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut head_inputs: HashMap<u64, Vec<u64>> = HashMap::new();
         for (catalog, planner) in catalogs.iter().zip(&rule_planners) {
             if let Some(head) = planner.transformations().last() {
-                idb_to_heads_map
+                head_inputs
                     .entry(catalog.head_idb_fingerprint())
                     .or_default()
                     .push(head.output().fingerprint());
             }
         }
+        let heads: HashMap<u64, HeadPlan> = program
+            .relations()
+            .iter()
+            .filter_map(|declaration| {
+                let relation = declaration.fingerprint();
+                head_inputs
+                    .remove(&relation)
+                    .map(|inputs| (relation, HeadPlan::new(declaration, inputs)))
+            })
+            .collect();
         let mut stratum_planner = Self {
             rule_planners,
             is_recursive,
             recursion_feedback_collections: stratified.recursive_relations().to_vec(),
             recursion_leave_collections: stratified.leave_relations().to_vec(),
-            idb_to_heads_map,
+            heads,
             atom_fps,
             mutabilities: stratified.mutabilities().clone(),
             ..Self::default()
@@ -249,13 +261,25 @@ impl StratumPlanner {
     /// Output relation fingerprints produced by this stratum.
     #[inline]
     pub fn output_relations(&self) -> HashSet<u64> {
-        self.idb_to_heads_map.keys().cloned().collect()
+        self.heads.keys().cloned().collect()
     }
 
-    /// Get the mapping from each IDB fingerprint to per-rule head fingerprints.
-    #[inline]
-    pub fn idb_to_heads_map(&self) -> &HashMap<u64, Vec<u64>> {
-        &self.idb_to_heads_map
+    /// Every relation's planned union inputs and head operation.
+    #[must_use]
+    pub fn heads(&self) -> &HashMap<u64, HeadPlan> {
+        &self.heads
+    }
+
+    /// Binds each head's earlier input before the stratum shadows it.
+    pub(super) fn bind_head_seeds(&mut self, bound_relations: &HashSet<u64>) {
+        for (&relation, head) in &mut self.heads {
+            let available = if self.is_recursive {
+                self.recursion_enter_collections.contains(&relation)
+            } else {
+                bound_relations.contains(&relation)
+            };
+            head.seed = available.then_some(relation);
+        }
     }
 
     /// Map of atom fingerprint to `"name(arg1, ..., argN)"` label for every
@@ -356,8 +380,7 @@ impl StratumPlanner {
             return;
         }
 
-        let mut dynamic_fingerprints: HashSet<u64> =
-            self.idb_to_heads_map.keys().copied().collect();
+        let mut dynamic_fingerprints: HashSet<u64> = self.heads.keys().copied().collect();
 
         let mut dynamic_indices = HashSet::new();
 
@@ -466,7 +489,7 @@ mod tests {
         let producing = |name: &str| {
             pp.strata()
                 .iter()
-                .find(|stratum| stratum.idb_to_heads_map().contains_key(&compute_fp(name)))
+                .find(|stratum| stratum.heads().contains_key(&compute_fp(name)))
                 .expect("a stratum produces the relation")
         };
         let (a, b) = (producing("a"), producing("b"));

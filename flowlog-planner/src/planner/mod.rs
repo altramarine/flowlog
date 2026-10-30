@@ -1,5 +1,6 @@
 mod argument;
 mod arithmetic;
+mod arity_order;
 mod canonical;
 mod collection;
 mod compare;
@@ -23,6 +24,8 @@ pub use constraint::Constraints;
 pub(crate) use error::PlanError;
 pub use program_planner::ProgramPlanner;
 pub(crate) use rule_planner::RulePlanner;
+pub use stratum_planner::HeadOperation;
+pub use stratum_planner::HeadPlan;
 pub use stratum_planner::StratumPlanner;
 pub(crate) use transformation::KeyValueLayout;
 pub use transformation::Transformation;

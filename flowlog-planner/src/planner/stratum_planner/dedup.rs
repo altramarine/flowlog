@@ -42,7 +42,7 @@ impl StratumPlanner {
     /// collections holding the same rows only as many are computed as the
     /// rest of the plan needs, the others becoming maps over them or
     /// aliases of them. The collections in `preludes` count as computed
-    /// already. The heads in `idb_to_heads_map` follow: a relation whose
+    /// already. The heads in `heads` follow: a relation whose
     /// head was merged or aliased unions the surviving collection instead.
     ///
     /// # Errors
@@ -130,11 +130,11 @@ impl StratumPlanner {
         for tx in &mut self.transformations {
             tx.swap_input(from, earlier);
         }
-        for heads in self.idb_to_heads_map.values_mut() {
-            if heads.contains(&from) {
-                heads.retain(|fp| *fp != from);
-                if !heads.contains(&earlier.fingerprint()) {
-                    heads.push(earlier.fingerprint());
+        for head in self.heads.values_mut() {
+            if head.inputs.contains(&from) {
+                head.inputs.retain(|fp| *fp != from);
+                if !head.inputs.contains(&earlier.fingerprint()) {
+                    head.inputs.push(earlier.fingerprint());
                 }
             }
         }
@@ -165,7 +165,12 @@ impl StratumPlanner {
     /// keyed collection. The rule planner produces none: it writes a
     /// collection only maps read as rows.
     fn cover_bodies(&mut self, preludes: &[Transformation]) -> Result<(), PlanError> {
-        let heads: HashSet<u64> = self.idb_to_heads_map.values().flatten().copied().collect();
+        let heads: HashSet<u64> = self
+            .heads
+            .values()
+            .flat_map(|head| head.inputs())
+            .copied()
+            .collect();
         // Readers by input fingerprint, as indices into this stratum's own
         // transformations; a prelude reads nothing of this stratum.
         let mut readers: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -526,7 +531,12 @@ impl StratumPlanner {
     /// and that no relation unions, repeating until none is left: a
     /// replaced join's private inputs fall in the second round.
     fn drop_unread(&mut self) {
-        let heads: HashSet<u64> = self.idb_to_heads_map.values().flatten().copied().collect();
+        let heads: HashSet<u64> = self
+            .heads
+            .values()
+            .flat_map(|head| head.inputs())
+            .copied()
+            .collect();
         loop {
             let read: HashSet<u64> = self
                 .transformations
@@ -733,8 +743,8 @@ mod tests {
         let pp = program_planner(WIDE_NARROW);
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let wide_head = stratum.idb_to_heads_map()[&compute_fp("wide")][0];
-        let narrow_head = stratum.idb_to_heads_map()[&compute_fp("narrow")][0];
+        let wide_head = stratum.heads()[&compute_fp("wide")].inputs()[0];
+        let narrow_head = stratum.heads()[&compute_fp("narrow")].inputs()[0];
 
         let binary: Vec<_> = txs.iter().filter(|tx| !tx.is_unary()).collect();
         assert_eq!(binary.len(), 1);
@@ -780,8 +790,8 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let wide_head = stratum.idb_to_heads_map()[&compute_fp("wide")][0];
-        let narrow_head = stratum.idb_to_heads_map()[&compute_fp("narrow")][0];
+        let wide_head = stratum.heads()[&compute_fp("wide")].inputs()[0];
+        let narrow_head = stratum.heads()[&compute_fp("narrow")].inputs()[0];
 
         let binary: Vec<_> = txs.iter().filter(|tx| !tx.is_unary()).collect();
         assert_eq!(binary.len(), 1);
@@ -819,8 +829,8 @@ mod tests {
         let txs = stratum.non_recursive_transformations();
 
         assert_eq!(
-            stratum.idb_to_heads_map()[&compute_fp("q")],
-            stratum.idb_to_heads_map()[&compute_fp("p")]
+            stratum.heads()[&compute_fp("q")].inputs(),
+            stratum.heads()[&compute_fp("p")].inputs()
         );
         assert_eq!(txs.iter().filter(|tx| !tx.is_unary()).count(), 1);
         // Two arrangements and one join: nothing of Q's own plan remains.
@@ -848,8 +858,8 @@ mod tests {
         let stratum = &pp.strata()[0];
 
         assert_eq!(
-            stratum.idb_to_heads_map()[&compute_fp("again")],
-            stratum.idb_to_heads_map()[&compute_fp("out")]
+            stratum.heads()[&compute_fp("again")].inputs(),
+            stratum.heads()[&compute_fp("out")].inputs()
         );
         assert_eq!(stratum.non_recursive_transformations().len(), 3);
     }
@@ -874,10 +884,10 @@ mod tests {
             Pair(x, y) :- Edge(x, y), Node(x).\n",
         );
         let stratum = &pp.strata()[0];
-        let [deg_head] = stratum.idb_to_heads_map()[&compute_fp("deg")][..] else {
+        let [deg_head] = stratum.heads()[&compute_fp("deg")].inputs()[..] else {
             panic!("Deg has one head");
         };
-        let [pair_head] = stratum.idb_to_heads_map()[&compute_fp("pair")][..] else {
+        let [pair_head] = stratum.heads()[&compute_fp("pair")].inputs()[..] else {
             panic!("Pair has one head");
         };
         assert_eq!(deg_head, pair_head);
@@ -907,7 +917,7 @@ mod tests {
             .iter()
             .find(|stratum| stratum.is_recursive())
             .expect("the recursive rule's stratum");
-        assert_eq!(stratum.idb_to_heads_map()[&compute_fp("dist")].len(), 1);
+        assert_eq!(stratum.heads()[&compute_fp("dist")].inputs().len(), 1);
         assert_eq!(
             stratum
                 .recursive_transformations()
@@ -940,8 +950,8 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let label_head = stratum.idb_to_heads_map()[&compute_fp("label")][0];
-        let full_head = stratum.idb_to_heads_map()[&compute_fp("full")][0];
+        let label_head = stratum.heads()[&compute_fp("label")].inputs()[0];
+        let full_head = stratum.heads()[&compute_fp("full")].inputs()[0];
 
         assert_eq!(txs.iter().filter(|tx| !tx.is_unary()).count(), 1);
         let full = txs
@@ -975,7 +985,7 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let copy_head = stratum.idb_to_heads_map()[&compute_fp("copy")][0];
+        let copy_head = stratum.heads()[&compute_fp("copy")].inputs()[0];
 
         let [product] = txs.iter().filter(|tx| !tx.is_unary()).collect::<Vec<_>>()[..] else {
             panic!("the product is the only join");
@@ -1019,7 +1029,7 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let same_head = stratum.idb_to_heads_map()[&compute_fp("same")][0];
+        let same_head = stratum.heads()[&compute_fp("same")].inputs()[0];
 
         assert_eq!(txs.iter().filter(|tx| !tx.is_unary()).count(), 2);
         let same = txs
@@ -1063,10 +1073,10 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let wide_head = stratum.idb_to_heads_map()[&compute_fp("wide")][0];
+        let wide_head = stratum.heads()[&compute_fp("wide")].inputs()[0];
         assert_eq!(txs.iter().filter(|tx| !tx.is_unary()).count(), 1);
         for name in ["left", "right"] {
-            let head = stratum.idb_to_heads_map()[&compute_fp(name)][0];
+            let head = stratum.heads()[&compute_fp(name)].inputs()[0];
             let tx = txs
                 .iter()
                 .find(|tx| tx.output().fingerprint() == head)
@@ -1101,7 +1111,7 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let same_head = stratum.idb_to_heads_map()[&compute_fp("same")][0];
+        let same_head = stratum.heads()[&compute_fp("same")].inputs()[0];
         let joins: Vec<_> = txs.iter().filter(|tx| !tx.is_unary()).collect();
         assert_eq!(joins.len(), 2);
         assert!(
@@ -1199,8 +1209,8 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let out_head = stratum.idb_to_heads_map()[&compute_fp("out")][0];
-        let swapped_head = stratum.idb_to_heads_map()[&compute_fp("swapped")][0];
+        let out_head = stratum.heads()[&compute_fp("out")].inputs()[0];
+        let swapped_head = stratum.heads()[&compute_fp("swapped")].inputs()[0];
 
         let binary: Vec<_> = txs.iter().filter(|tx| !tx.is_unary()).collect();
         assert_eq!(binary.len(), 1);
@@ -1237,7 +1247,7 @@ mod tests {
         );
         let stratum = &pp.strata()[0];
         let txs = stratum.non_recursive_transformations();
-        let head = stratum.idb_to_heads_map()[&compute_fp("v")][0];
+        let head = stratum.heads()[&compute_fp("v")].inputs()[0];
 
         let [semijoin] = txs.iter().filter(|tx| !tx.is_unary()).collect::<Vec<_>>()[..] else {
             panic!("one semijoin of A and B");
