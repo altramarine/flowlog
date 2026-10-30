@@ -22,13 +22,19 @@ pub struct ProgramPlanner {
 impl ProgramPlanner {
     /// Runs the full planner pipeline against `program`: stratify, then
     /// build a [`StratumPlanner`] per stratum in order, each sharing the
-    /// collections the preludes before it compute. Indexes declarations
-    /// once so each stratum builds only the heads it produces.
+    /// collections the preludes before it compute. Earlier relation
+    /// bindings are retained as fully resolved relation seeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from stratification or rule planning.
     pub fn from_program(
         program: &Program,
         plan_graph: &mut Option<PlanGraph>,
     ) -> Result<Self, BoxError> {
         let stratifier = Stratifier::from_program(program).map_err(BoxError::from)?;
+        // A relation can contribute to several strata; index declarations
+        // once to avoid searching the whole schema for each head.
         let declarations: HashMap<u64, &Relation> = program
             .relations()
             .iter()
@@ -39,16 +45,16 @@ impl ProgramPlanner {
         let mut strata = Vec::with_capacity(stratifier.strata().len());
         let mut bound_relations = program.edb_fingerprints();
         for stratum in stratifier.strata() {
-            let mut planned = StratumPlanner::from_stratum(
+            let planned = StratumPlanner::from_stratum(
                 program,
                 stratum,
                 &mut optimizer,
                 plan_graph,
                 &preludes,
                 &declarations,
+                &bound_relations,
             )
             .map_err(BoxError::from)?;
-            planned.bind_head_seeds(&bound_relations);
             bound_relations.extend(planned.output_relations());
             preludes.extend(planned.non_recursive_transformations().iter().cloned());
             strata.push(planned);
@@ -297,7 +303,12 @@ mod tests {
         let heads: Vec<u64> = pp
             .strata()
             .iter()
-            .flat_map(|s| s.heads().values().flat_map(|head| head.inputs()).copied())
+            .flat_map(|s| {
+                s.relation_bindings()
+                    .values()
+                    .flat_map(|binding| binding.inputs())
+                    .copied()
+            })
             .collect();
         assert_eq!(heads.len(), 2, "P and Q must each keep their own head");
         assert_ne!(

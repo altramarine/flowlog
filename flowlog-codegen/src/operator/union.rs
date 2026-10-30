@@ -1,16 +1,8 @@
-//! Unions: the step a stratum chains to bind a relation from its parts,
-//! the collections its rules produce for it and its earlier binding, each
-//! at the weight the stratum gives it. [`Codegen::gen_head`] unions them
-//! into one expression and applies the planned dedup or aggregation. It
-//! records the step in the plan graph under the name its caller binds;
-//! the strata own the parts, the names and the order.
-//!
-//! Differential Dataflow's `concatenate` needs every part at one weight,
-//! so a relation unions at its most mutable part's weight, and each part
-//! below that weight is lifted to it first.
+//! Relation-binding lowering: unions rule results with an earlier binding,
+//! applies the planned operation, and records the runtime steps.
 
 use flowlog_parser::Mutability;
-use flowlog_planner::planner::HeadOperation;
+use flowlog_planner::planner::BindingOperation;
 use flowlog_profiler::PlanGraph;
 use flowlog_profiler::with_plan_graph;
 use proc_macro2::Ident;
@@ -22,19 +14,22 @@ use crate::CodegenError;
 use crate::ty::diff::weight_tokens;
 
 impl Codegen {
-    /// Unions `parts` at their most mutable weight, then applies the
-    /// planned head `operation`. Records the runtime steps under `output`,
-    /// inside a loop when `recursive` is true.
+    /// Returns the relation's rows and output mutability after applying
+    /// `operation` to the union of `parts`. Dedup preserves the union's
+    /// most mutable weight. Aggregation returns `Static` for static rows
+    /// and `Mutable` otherwise, including for `Append` inputs.
+    /// Records the runtime steps under `output`, inside a loop when
+    /// `recursive` is true.
     ///
     /// # Errors
     ///
-    /// Returns an internal error when the head has no inputs or a planned
-    /// aggregation has no declared relation.
-    pub(crate) fn gen_head(
+    /// Returns an internal error when the binding has no inputs or a planned
+    /// aggregation has no relation declaration or no min/max column.
+    pub(crate) fn gen_relation_binding(
         &self,
         idb_fp: u64,
         parts: &[(Ident, Mutability)],
-        operation: HeadOperation,
+        operation: BindingOperation,
         output: &Ident,
         recursive: bool,
         plan_graph: &mut Option<PlanGraph>,
@@ -46,8 +41,8 @@ impl Codegen {
             )));
         };
         let dedup = match operation {
-            HeadOperation::Dedup => true,
-            HeadOperation::Aggregation => false,
+            BindingOperation::Dedup => true,
+            BindingOperation::Aggregation => false,
         };
         let mutability = rest
             .iter()
@@ -68,16 +63,15 @@ impl Codegen {
                 quote! { #collection.clone() }
             }
         };
-        let head = lift(first, *first_mutability);
+        let first_rows = lift(first, *first_mutability);
         let tail: Vec<TokenStream> = rest.iter().map(|(c, part)| lift(c, *part)).collect();
         let union = if tail.is_empty() {
-            head
+            first_rows
         } else {
-            quote! { #head.concatenate([ #( #tail ),* ]) }
+            quote! { #first_rows.concatenate([ #( #tail ),* ]) }
         };
 
         with_plan_graph(plan_graph, |plan_graph| {
-            // A part less mutable than the relation is lifted.
             let lifts: u32 = parts
                 .iter()
                 .map(|(_, part)| u32::from(*part < mutability))
@@ -93,11 +87,11 @@ impl Codegen {
         });
 
         match operation {
-            HeadOperation::Dedup => Ok((
+            BindingOperation::Dedup => Ok((
                 quote! { ::flowlog_runtime::operators::flowlog_dedup(#union) },
                 mutability,
             )),
-            HeadOperation::Aggregation => {
+            BindingOperation::Aggregation => {
                 self.gen_lattice_merge(idb_fp, union, mutability, output, plan_graph)
             }
         }
@@ -165,12 +159,12 @@ mod tests {
         let parts: Vec<(Ident, Mutability)> =
             parts.into_iter().map(|(p, m)| (ident(p), m)).collect();
         let (deduped, found) = codegen
-            .gen_head(
+            .gen_relation_binding(
                 s,
                 &parts,
-                HeadOperation::Dedup,
+                BindingOperation::Dedup,
                 &ident("r"),
-                false,
+                /*recursive*/ false,
                 &mut None,
             )
             .expect("parts to union");
@@ -180,21 +174,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_aggregation_head_merges_without_a_whole_row_dedup() {
+    // Cases: input weight, output weight.
+    #[rstest]
+    #[case::static_rows(Mutability::Static, Mutability::Static)]
+    #[case::append_rows(Mutability::Append, Mutability::Mutable)]
+    #[case::mutable_rows(Mutability::Mutable, Mutability::Mutable)]
+    fn an_aggregation_binding_merges_without_a_whole_row_dedup(
+        #[case] input: Mutability,
+        #[case] expected: Mutability,
+    ) {
         let codegen = codegen(LATTICE_PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
-        let parts = [
-            (ident("t_1"), Mutability::Static),
-            (ident("t_2"), Mutability::Static),
-        ];
+        let parts = [(ident("t_1"), input), (ident("t_2"), input)];
         let (rows, found) = codegen
-            .gen_head(
+            .gen_relation_binding(
                 s,
                 &parts,
-                HeadOperation::Aggregation,
+                BindingOperation::Aggregation,
                 &ident("r"),
-                false,
+                /*recursive*/ false,
                 &mut None,
             )
             .expect("parts to union");
@@ -211,8 +209,31 @@ mod tests {
                     )
                 }
                 .to_string(),
-                Mutability::Static
+                expected
             )
+        );
+    }
+
+    #[test]
+    fn an_aggregation_binding_without_a_min_max_column_is_an_internal_error() {
+        let codegen = codegen(PROGRAM);
+        let relation = codegen.program.idbs()[0].fingerprint();
+        let error = codegen
+            .gen_relation_binding(
+                relation,
+                &[(ident("rows"), Mutability::Static)],
+                BindingOperation::Aggregation,
+                &ident("out"),
+                /*recursive*/ false,
+                &mut None,
+            )
+            .expect_err("S has no min/max column");
+        assert!(matches!(&error, CodegenError::Internal(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("relation `S` has no declared min/max column"),
+            "{error}"
         );
     }
 
@@ -223,7 +244,14 @@ mod tests {
         let codegen = codegen(PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
         let error = codegen
-            .gen_head(s, &[], HeadOperation::Dedup, &ident("r"), false, &mut None)
+            .gen_relation_binding(
+                s,
+                &[],
+                BindingOperation::Dedup,
+                &ident("r"),
+                /*recursive*/ false,
+                &mut None,
+            )
             .expect_err("nothing to union");
         assert!(matches!(error, CodegenError::Internal(_)));
     }

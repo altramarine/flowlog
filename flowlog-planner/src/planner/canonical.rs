@@ -2214,9 +2214,9 @@ mod tests {
         let stratum = pp
             .strata()
             .iter()
-            .find(|stratum| stratum.heads().contains_key(&idb))
+            .find(|stratum| stratum.relation_bindings().contains_key(&idb))
             .expect("relation is produced by some stratum");
-        let [head] = stratum.heads()[&idb].inputs() else {
+        let [head] = stratum.relation_bindings()[&idb].inputs() else {
             panic!("relation {name} has more than one rule");
         };
         stratum

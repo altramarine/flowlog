@@ -1,14 +1,14 @@
-//! Relation heads: their union inputs and the operation binding the result.
+//! Relation bindings: their rule results, earlier seeds, and operations.
 
 use flowlog_parser::Relation;
 
 // =============================================================================
-// HeadOperation
+// BindingOperation
 // =============================================================================
 
 /// The operation applied after a relation's inputs are unioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeadOperation {
+pub enum BindingOperation {
     /// Dedups whole rows in their logical column order.
     Dedup,
     /// Merges the declared min/max column by every other column. Its
@@ -17,25 +17,46 @@ pub enum HeadOperation {
 }
 
 // =============================================================================
-// HeadPlan
+// RelationBindingPlan
 // =============================================================================
 
-/// A relation's head after sharing: the earlier binding, when present,
-/// followed by the rule results, and the operation binding their union.
+/// The plan for binding a relation's result within one stratum.
+///
+/// A rule head describes the rows produced by one rule. A relation binding
+/// combines the results of all rules for that relation in this stratum,
+/// preserving any earlier input or result for the same relation.
+///
+/// The plan contains three parts:
+///
+/// - [`inputs`](Self::inputs): the rule-result collection fingerprints after
+///   sharing, in concatenation order. Several rules can share one input.
+/// - [`seed`](Self::seed): an optional earlier binding of the relation,
+///   supplied by an input declaration or an earlier stratum. Inside recursion,
+///   it refers to the entered outer binding, separately from the feedback
+///   variable. A completed stratum has already resolved whether a seed exists.
+/// - [`operation`](Self::operation): whole-row [`BindingOperation::Dedup`] or
+///   [`BindingOperation::Aggregation`] for a declared min/max column. This
+///   selects the relation's operation; aggregates inside rule bodies belong
+///   to those rules' plans.
+///
+/// The seed, when present, precedes the rule results in their union. The
+/// selected operation applies to that union, including when there is only
+/// one input. Declared aggregation consumes the union directly, without a
+/// separate whole-row dedup.
 #[derive(Debug)]
-pub struct HeadPlan {
+pub struct RelationBindingPlan {
     pub(super) inputs: Vec<u64>,
     pub(super) seed: Option<u64>,
-    pub(super) operation: HeadOperation,
+    pub(super) operation: BindingOperation,
 }
 
-impl HeadPlan {
+impl RelationBindingPlan {
     #[must_use]
     pub(super) fn new(declaration: &Relation, inputs: Vec<u64>) -> Self {
         let operation = if declaration.lattice().is_some() {
-            HeadOperation::Aggregation
+            BindingOperation::Aggregation
         } else {
-            HeadOperation::Dedup
+            BindingOperation::Dedup
         };
         Self {
             inputs,
@@ -58,7 +79,7 @@ impl HeadPlan {
     }
 
     #[must_use]
-    pub fn operation(&self) -> HeadOperation {
+    pub fn operation(&self) -> BindingOperation {
         self.operation
     }
 }
@@ -66,44 +87,28 @@ impl HeadPlan {
 #[cfg(test)]
 mod tests {
     use flowlog_common::compute_fp;
+    use flowlog_parser::test_harness::program;
     use rstest::rstest;
 
     use super::*;
     use crate::test_harness::program_planner;
 
-    #[test]
-    fn ordinary_heads_plan_a_whole_row_dedup() {
-        let plan = program_planner(
-            r#"
-            .decl E(a: int32, b: symbol)
-            .input E
-            .decl R(a: int32, b: symbol)
-            .output R
-            R(a,b) :- E(a,b).
-            "#,
-        );
-        let head = &plan.strata()[0].heads()[&compute_fp("r")];
-        assert_eq!(head.operation(), HeadOperation::Dedup);
-        assert_eq!(head.seed(), None);
-        assert_eq!(head.inputs().len(), 1);
-    }
-
-    // Cases: declared aggregation.
+    // Cases: declaration fields, binding operation.
     #[rstest]
-    #[case("min")]
-    #[case("max")]
-    fn declared_aggregation_heads_do_not_plan_a_whole_row_dedup(#[case] aggregate: &str) {
-        let plan = program_planner(&format!(
-            ".decl E(a: int32, b: int32)\n.input E\n\
-             .decl R(a: int32, b: {aggregate}<int32>)\n.output R\n\
-             R(a,b) :- E(a,b).\n"
-        ));
-        let head = &plan.strata()[0].heads()[&compute_fp("r")];
-        assert_eq!(head.operation(), HeadOperation::Aggregation);
+    #[case::ordinary("a: int32, b: symbol", BindingOperation::Dedup)]
+    #[case::minimum("a: int32, b: min<int32>", BindingOperation::Aggregation)]
+    #[case::maximum("a: int32, b: max<int32>", BindingOperation::Aggregation)]
+    fn a_binding_selects_its_operation_from_the_declaration(
+        #[case] fields: &str,
+        #[case] expected: BindingOperation,
+    ) {
+        let program = program(&format!(".decl R({fields})\n.input R\n.output R\n"));
+        let binding = RelationBindingPlan::new(&program.relations()[0], vec![0x11]);
+        assert_eq!(binding.operation(), expected);
     }
 
     #[test]
-    fn a_recursive_head_keeps_its_outer_seed_apart_from_feedback() {
+    fn a_recursive_binding_keeps_its_outer_seed_apart_from_feedback() {
         let plan = program_planner(
             r#"
             .decl Arc(x: int32, y: int32)
@@ -118,10 +123,10 @@ mod tests {
             panic!("Reach has a base stratum and a recursive stratum");
         };
         let relation = compute_fp("reach");
-        assert_eq!(base.heads()[&relation].seed(), None);
-        let head = &recursive.heads()[&relation];
-        assert_eq!(head.seed(), Some(relation));
-        assert!(!head.inputs().contains(&relation));
+        assert_eq!(base.relation_bindings()[&relation].seed(), None);
+        let binding = &recursive.relation_bindings()[&relation];
+        assert_eq!(binding.seed(), Some(relation));
+        assert!(!binding.inputs().contains(&relation));
         assert!(
             recursive
                 .recursion_feedback_collections()
@@ -130,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_non_recursive_head_keeps_the_earlier_binding() {
+    fn a_later_non_recursive_binding_keeps_the_earlier_binding() {
         let plan = program_planner(
             r#"
             .decl E(x: int32)
@@ -153,15 +158,15 @@ mod tests {
         let relation = compute_fp("r");
         assert!(!base.is_recursive());
         assert!(!later.is_recursive());
-        assert_eq!(base.heads()[&relation].seed(), None);
-        let head = &later.heads()[&relation];
-        assert_eq!(head.seed(), Some(relation));
-        assert_eq!(head.inputs().len(), 1);
-        assert!(!head.inputs().contains(&relation));
+        assert_eq!(base.relation_bindings()[&relation].seed(), None);
+        let binding = &later.relation_bindings()[&relation];
+        assert_eq!(binding.seed(), Some(relation));
+        assert_eq!(binding.inputs().len(), 1);
+        assert!(!binding.inputs().contains(&relation));
     }
 
     #[test]
-    fn a_head_unions_its_existing_input_relation() {
+    fn a_binding_unions_its_existing_input_relation() {
         let plan = program_planner(
             r#"
             .decl E(a: int32)
@@ -173,7 +178,7 @@ mod tests {
             "#,
         );
         assert_eq!(
-            plan.strata()[0].heads()[&compute_fp("r")].seed(),
+            plan.strata()[0].relation_bindings()[&compute_fp("r")].seed(),
             Some(compute_fp("r"))
         );
     }
