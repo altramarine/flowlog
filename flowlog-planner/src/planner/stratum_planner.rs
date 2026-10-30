@@ -12,6 +12,7 @@ use flowlog_common::SUBSECTION_BAR;
 use flowlog_parser::FlowLogRule;
 use flowlog_parser::Mutability;
 use flowlog_parser::Program;
+use flowlog_parser::Relation;
 use flowlog_profiler::PlanGraph;
 use flowlog_profiler::with_plan_graph;
 use tracing::debug;
@@ -24,7 +25,11 @@ use crate::planner::RulePlanner;
 use crate::planner::Transformation;
 use crate::stratifier::Stratum;
 
+mod binding;
 mod dedup;
+
+pub use binding::BindingOperation;
+pub use binding::RelationBindingPlan;
 
 /// Planned transformations and execution metadata for one stratum.
 ///
@@ -59,11 +64,8 @@ pub struct StratumPlanner {
     /// Fingerprints of collections that exit recursion.
     recursion_leave_collections: Vec<u64>,
 
-    /// The collections whose rows each relation of this stratum unions:
-    /// one per rule as planned, fewer once sharing lets one collection
-    /// stand for several heads. Codegen concatenates them per relation,
-    /// and merges a lattice relation's union by its declared column.
-    idb_to_heads_map: HashMap<u64, Vec<u64>>,
+    /// Each relation's inputs, seed, and dedup or declared aggregation.
+    relation_bindings: HashMap<u64, RelationBindingPlan>,
 
     /// Atom fingerprints unioned across every rule's rhs. Computed once at
     /// stratum construction so codegen can tell which transformation inputs
@@ -78,13 +80,21 @@ pub struct StratumPlanner {
 impl StratumPlanner {
     /// Builds a stratum planner from a stratum, sharing work with
     /// `preludes`, the non-recursive transformations of the strata before
-    /// it in order.
+    /// it in order. Every relation binding includes its earlier seed from
+    /// `bound_relations`, or its entered outer binding inside recursion.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from rule planning or sharing, including internal
+    /// errors for inconsistent metadata or dependencies.
     pub(crate) fn from_stratum(
         program: &Program,
         stratified: &Stratum,
         optimizer: &mut Optimizer,
         plan_graph: &mut Option<PlanGraph>,
         preludes: &[Transformation],
+        declarations: &HashMap<u64, &Relation>,
+        bound_relations: &HashSet<u64>,
     ) -> Result<Self, PlanError> {
         let rules = program.rules();
         let stratum: Vec<FlowLogRule> = stratified
@@ -169,21 +179,33 @@ impl StratumPlanner {
             .collect();
         // Each rule's last transformation is its head; dedup rewrites the
         // map as it merges heads or serves one from another collection.
-        let mut idb_to_heads_map: HashMap<u64, Vec<u64>> = HashMap::new();
-        for (catalog, planner) in catalogs.iter().zip(&rule_planners) {
-            if let Some(head) = planner.transformations().last() {
-                idb_to_heads_map
+        let mut rule_outputs: HashMap<u64, Vec<u64>> = HashMap::new();
+        let rule_contexts = catalogs.iter().zip(&rule_planners);
+        for (catalog, planner) in rule_contexts {
+            if let Some(output) = planner.transformations().last() {
+                rule_outputs
                     .entry(catalog.head_idb_fingerprint())
                     .or_default()
-                    .push(head.output().fingerprint());
+                    .push(output.output().fingerprint());
             }
         }
+        let relation_bindings: HashMap<u64, RelationBindingPlan> = rule_outputs
+            .into_iter()
+            .map(|(relation, inputs)| {
+                let declaration = declarations.get(&relation).ok_or_else(|| {
+                    PlanError::internal(format!(
+                        "relation binding 0x{relation:016x} has no declaration"
+                    ))
+                })?;
+                Ok((relation, RelationBindingPlan::new(declaration, inputs)))
+            })
+            .collect::<Result<_, PlanError>>()?;
         let mut stratum_planner = Self {
             rule_planners,
             is_recursive,
             recursion_feedback_collections: stratified.recursive_relations().to_vec(),
             recursion_leave_collections: stratified.leave_relations().to_vec(),
-            idb_to_heads_map,
+            relation_bindings,
             atom_fps,
             mutabilities: stratified.mutabilities().clone(),
             ..Self::default()
@@ -195,7 +217,23 @@ impl StratumPlanner {
         stratum_planner
             .build_recursion_enter_collections(stratified.available_relations(), preludes);
 
-        // Debug info for non-recursive vs recursive transformations.
+        // Phase 8 resolves seeds after recursion-entry metadata is complete, so
+        // recursive bindings only reference inputs available inside the loop.
+        // Finish before returning so the plan needs no later binding pass.
+        let entered: HashSet<u64> = stratum_planner
+            .recursion_enter_collections
+            .iter()
+            .copied()
+            .collect();
+        let available = if is_recursive {
+            &entered
+        } else {
+            bound_relations
+        };
+        for (&relation, binding) in &mut stratum_planner.relation_bindings {
+            binding.seed = available.contains(&relation).then_some(relation);
+        }
+
         debug!("\n{}", stratum_planner);
 
         Ok(stratum_planner)
@@ -247,15 +285,15 @@ impl StratumPlanner {
     }
 
     /// Output relation fingerprints produced by this stratum.
-    #[inline]
-    pub fn output_relations(&self) -> HashSet<u64> {
-        self.idb_to_heads_map.keys().cloned().collect()
+    #[must_use = "consume the iterator to read the produced relations"]
+    pub fn output_relations(&self) -> impl Iterator<Item = u64> + '_ {
+        self.relation_bindings.keys().copied()
     }
 
-    /// Get the mapping from each IDB fingerprint to per-rule head fingerprints.
-    #[inline]
-    pub fn idb_to_heads_map(&self) -> &HashMap<u64, Vec<u64>> {
-        &self.idb_to_heads_map
+    /// Each relation's planned inputs, seed, and binding operation.
+    #[must_use]
+    pub fn relation_bindings(&self) -> &HashMap<u64, RelationBindingPlan> {
+        &self.relation_bindings
     }
 
     /// Map of atom fingerprint to `"name(arg1, ..., argN)"` label for every
@@ -280,7 +318,7 @@ impl StratumPlanner {
     /// A relation it reads has its final value. A relation it produces has
     /// the value of everything produced for it up to this stratum, so a
     /// relation whose rules span strata can have a lower value in an earlier
-    /// one. Every head of a recursive stratum has the same value.
+    /// one. Recursive relation bindings all have the same value.
     #[must_use]
     pub fn mutability(&self, relation_fp: u64) -> Option<Mutability> {
         self.mutabilities.get(&relation_fp).copied()
@@ -357,7 +395,7 @@ impl StratumPlanner {
         }
 
         let mut dynamic_fingerprints: HashSet<u64> =
-            self.idb_to_heads_map.keys().copied().collect();
+            self.relation_bindings.keys().copied().collect();
 
         let mut dynamic_indices = HashSet::new();
 
@@ -442,9 +480,45 @@ impl StratumPlanner {
 #[cfg(test)]
 mod tests {
     use flowlog_common::compute_fp;
+    use flowlog_parser::test_harness::program;
 
     use super::*;
+    use crate::stratifier::Stratifier;
     use crate::test_harness::program_planner;
+
+    #[test]
+    fn stratum_construction_resolves_the_existing_input_seed() {
+        let program = program(
+            r#"
+            .decl E(x: int32)
+            .input E
+            .decl R(x: int32)
+            .input R
+            .output R
+            R(x) :- E(x).
+            "#,
+        );
+        let stratifier = Stratifier::from_program(&program).expect("stratified");
+        let declarations: HashMap<u64, &Relation> = program
+            .relations()
+            .iter()
+            .map(|relation| (relation.fingerprint(), relation))
+            .collect();
+        let stratum = StratumPlanner::from_stratum(
+            &program,
+            &stratifier.strata()[0],
+            &mut Optimizer::new(),
+            &mut None,
+            &[],
+            &declarations,
+            &program.edb_fingerprints(),
+        )
+        .expect("planned");
+        assert_eq!(
+            stratum.relation_bindings()[&compute_fp("r")].seed(),
+            Some(compute_fp("r"))
+        );
+    }
 
     /// A planned stratum carries the stratifier's value for each relation it
     /// reads or produces, and none for a relation it does not touch.
@@ -466,7 +540,7 @@ mod tests {
         let producing = |name: &str| {
             pp.strata()
                 .iter()
-                .find(|stratum| stratum.idb_to_heads_map().contains_key(&compute_fp(name)))
+                .find(|stratum| stratum.relation_bindings().contains_key(&compute_fp(name)))
                 .expect("a stratum produces the relation")
         };
         let (a, b) = (producing("a"), producing("b"));

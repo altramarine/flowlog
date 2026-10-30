@@ -7,7 +7,6 @@
 mod non_recursive;
 mod recursive;
 
-use std::collections::HashSet;
 use std::mem;
 
 use flowlog_planner::planner::StratumPlanner;
@@ -29,21 +28,16 @@ impl Codegen {
         plan_graph: &mut Option<PlanGraph>,
     ) -> Result<Vec<TokenStream>, CodegenError> {
         let mut flows = Vec::with_capacity(strata.len());
-        // Relations whose outer ident is already bound, by an input or a
-        // prior stratum. Without the inputs, a rule for an EDB relation
-        // would shadow the EDB binding and drop its tuples.
-        let mut bound_fps: HashSet<u64> = self.program.edb_fingerprints();
-
-        for (idx, stratum) in strata.iter().enumerate() {
+        let evaluation_order = strata.iter().enumerate();
+        for (idx, stratum) in evaluation_order {
             with_plan_graph(plan_graph, |plan_graph| {
                 plan_graph.update_stratum_block(idx);
             });
             flows.push(if stratum.is_recursive() {
                 self.gen_recursive(stratum, plan_graph)?
             } else {
-                self.gen_non_recursive(stratum, &bound_fps, plan_graph)?
+                self.gen_non_recursive(stratum, plan_graph)?
             });
-            bound_fps.extend(stratum.output_relations());
         }
         Ok(flows)
     }

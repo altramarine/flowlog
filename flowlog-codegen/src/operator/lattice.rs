@@ -20,20 +20,35 @@ use crate::expr::aggregation::aggregation_merge;
 use crate::expr::aggregation::aggregation_split;
 use crate::expr::aggregation::lattice_kind;
 
+// =============================================================================
+// MergeArgs
+// =============================================================================
+
+/// Runtime aggregation kind and closures for a declared min/max column.
+#[derive(Debug)]
+struct MergeArgs {
+    kind: TokenStream,
+    split: TokenStream,
+    merge: TokenStream,
+}
+
+// =============================================================================
+// Codegen
+// =============================================================================
+
 impl Codegen {
-    /// Returns `<reduce>(<rows>, ..)`, the merge of relation `idb_fp`'s
-    /// `rows`, an expression at `rows_mutability` that the caller binds as
-    /// `output`, and the merge's weight: an aggregate's over the rows.
-    /// Records the step in the plan graph. A plain relation has no merge:
-    /// its rows come back as they are, at their weight.
+    /// Returns rows merged by the declared min/max column and the output
+    /// mutability: static for static rows, mutable otherwise. Groups are
+    /// identified by every other column. Records the runtime steps under
+    /// `output`.
     ///
-    /// The rows need not be a set: the merge is an extreme, so a row the
-    /// union holds several times merges as one, and nothing dedups it
-    /// first.
+    /// Duplicate rows do not change the result, so the input need not be
+    /// deduped first.
     ///
     /// # Errors
     ///
-    /// Returns an internal error if `idb_fp` is no relation.
+    /// Returns an internal error if `idb_fp` has no declaration or no
+    /// declared min/max column.
     pub(crate) fn gen_lattice_merge(
         &self,
         idb_fp: u64,
@@ -42,9 +57,7 @@ impl Codegen {
         output: &Ident,
         plan_graph: &mut Option<PlanGraph>,
     ) -> Result<(TokenStream, Mutability), CodegenError> {
-        let Some((kind, split, merge)) = self.merge_args(idb_fp)? else {
-            return Ok((rows, rows_mutability));
-        };
+        let MergeArgs { kind, split, merge } = self.merge_args(idb_fp)?;
         let name = self.display_name(idb_fp);
         // The append merge mirrors the mutable one operator for operator.
         // The union feeding the merge is recorded under the output's name
@@ -91,11 +104,7 @@ impl Codegen {
         plan_graph: &mut Option<PlanGraph>,
     ) -> Result<TokenStream, CodegenError> {
         let name = self.display_name(idb_fp);
-        let Some((kind, split, merge)) = self.merge_args(idb_fp)? else {
-            return Err(CodegenError::internal(format!(
-                "`{name}` is no lattice relation to fold"
-            )));
-        };
+        let MergeArgs { kind, split, merge } = self.merge_args(idb_fp)?;
         with_plan_graph(plan_graph, |plan_graph| {
             plan_graph.recursive_pre_leave_lattice_operator(
                 name.clone(),
@@ -111,25 +120,25 @@ impl Codegen {
         })
     }
 
-    /// The pieces every merge of relation `idb_fp` passes the runtime: the
-    /// aggregation, the closure taking the lattice column out of a row and
-    /// the one putting the answer back; `None` for a plain relation.
+    /// Returns the aggregation kind and row split/merge closures for
+    /// relation `idb_fp`'s declared min/max column.
     ///
     /// # Errors
     ///
-    /// Returns an internal error if `idb_fp` is no relation.
-    fn merge_args(
-        &self,
-        idb_fp: u64,
-    ) -> Result<Option<(TokenStream, TokenStream, TokenStream)>, CodegenError> {
+    /// Returns an internal error if `idb_fp` has no declaration or no
+    /// declared min/max column.
+    fn merge_args(&self, idb_fp: u64) -> Result<MergeArgs, CodegenError> {
         let Some(relation) = self.program.relation_by_fingerprint(idb_fp) else {
             return Err(CodegenError::internal(format!(
-                "`{}` is no relation to merge",
+                "cannot generate a min/max merge for undeclared relation `{}`",
                 self.display_name(idb_fp)
             )));
         };
         let Some((position, lattice)) = relation.lattice() else {
-            return Ok(None);
+            return Err(CodegenError::internal(format!(
+                "relation `{}` has no declared min/max column",
+                relation.raw_name()
+            )));
         };
         let arity = relation.arity();
         let kind = lattice_kind(lattice);
@@ -140,7 +149,7 @@ impl Codegen {
             &relation.data_type()[position],
             self.config.str_intern_enabled(),
         );
-        Ok(Some((kind, split, merge)))
+        Ok(MergeArgs { kind, split, merge })
     }
 }
 
@@ -203,12 +212,11 @@ mod tests {
         );
     }
 
-    /// A plain relation has no merge: its rows pass through at their weight.
     #[test]
-    fn a_plain_relations_rows_pass_through() {
+    fn merging_a_plain_relation_is_an_internal_error() {
         let codegen = codegen(PLAIN_PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
-        let (tokens, mutability) = codegen
+        let error = codegen
             .gen_lattice_merge(
                 s,
                 quote! { rows },
@@ -216,10 +224,13 @@ mod tests {
                 &ident("out"),
                 &mut None,
             )
-            .expect("S is a relation");
-        assert_eq!(
-            (tokens.to_string(), mutability),
-            ("rows".to_string(), Mutability::Static)
+            .expect_err("S has no min/max column");
+        assert!(matches!(&error, CodegenError::Internal(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("relation `S` has no declared min/max column"),
+            "{error}"
         );
     }
 
@@ -250,6 +261,12 @@ mod tests {
         let error = codegen
             .gen_lattice_fold(s, &ident("next"), &ident("out"), &mut None)
             .expect_err("S has no lattice column");
-        assert!(error.to_string().contains("no lattice relation"), "{error}");
+        assert!(matches!(&error, CodegenError::Internal(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("relation `S` has no declared min/max column"),
+            "{error}"
+        );
     }
 }
