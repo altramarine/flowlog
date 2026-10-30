@@ -247,14 +247,18 @@ impl Codegen {
     ) -> Result<Vec<TokenStream>, CodegenError> {
         let mutability = recursion.mutability;
         let mut stmts = Vec::new();
-        for (idb_fp, head_fps) in stratum.idb_to_heads_map() {
+        for (idb_fp, head_plan) in stratum.heads() {
             let name = self.display_name(*idb_fp);
             let next = format_ident!("next_{idb_fp}");
-            let parts = self.recursive_parts(recursion, *idb_fp, head_fps)?;
-            let (rows, rows_mutability) =
-                self.gen_union(*idb_fp, &parts, &next, true, plan_graph)?;
-            let (head, found) =
-                self.gen_lattice_merge(*idb_fp, rows, rows_mutability, &next, plan_graph)?;
+            let parts = self.recursive_parts(recursion, head_plan.seed(), head_plan.inputs())?;
+            let (head, found) = self.gen_head(
+                *idb_fp,
+                &parts,
+                head_plan.operation(),
+                &next,
+                true,
+                plan_graph,
+            )?;
             // The stratifier assigns the relation the same value on its own
             // (Lemma 4 of `docs/design/mutability.md`), and every head of
             // the loop shares the loop's weight.
@@ -407,8 +411,8 @@ impl Codegen {
         Ok(mutability)
     }
 
-    /// Returns the parts relation `idb_fp` unions inside `recursion`: its
-    /// entered binding, when it has one, at the weight it entered with,
+    /// Resolves a head's planned union inputs inside `recursion`: its
+    /// entered seed, at the weight it entered with,
     /// then the heads `head_fps` as the recursion binds them. A head the
     /// recursion produces, or a feedback relation a rule reads as it is,
     /// is at the recursion's weight, whatever weight the relation's
@@ -417,13 +421,17 @@ impl Codegen {
     fn recursive_parts(
         &self,
         recursion: &Recursion,
-        idb_fp: u64,
+        seed: Option<u64>,
         head_fps: &[u64],
     ) -> Result<Vec<(Ident, Mutability)>, CodegenError> {
-        let entered = recursion
-            .entered
-            .get(&idb_fp)
-            .map(|binding| Ok((binding.clone(), self.mutability(idb_fp)?)));
+        let entered = seed.map(|fp| {
+            let binding = recursion.entered.get(&fp).ok_or_else(|| {
+                CodegenError::internal(format!(
+                    "planned head seed 0x{fp:016x} has no entered binding"
+                ))
+            })?;
+            Ok((binding.clone(), self.mutability(fp)?))
+        });
         entered
             .into_iter()
             .chain(head_fps.iter().map(|fp| {
@@ -475,7 +483,7 @@ mod tests {
         recursion.local_fp_to_ident = [(s, ident("recursive_s")), (r, ident("in_r"))].into();
 
         let parts = codegen
-            .recursive_parts(&recursion, s, &[s, r, 0x7])
+            .recursive_parts(&recursion, Some(s), &[s, r, 0x7])
             .expect("every part has a weight");
         assert_eq!(
             parts,

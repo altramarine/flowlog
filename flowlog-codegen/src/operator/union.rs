@@ -1,7 +1,7 @@
 //! Unions: the step a stratum chains to bind a relation from its parts,
 //! the collections its rules produce for it and its earlier binding, each
-//! at the weight the stratum gives it. [`Codegen::gen_union`] unions them
-//! into one expression, dedupped unless a lattice merge follows, and
+//! at the weight the stratum gives it. [`Codegen::gen_head`] unions them
+//! into one expression and applies the planned dedup or aggregation. It
 //! records the step in the plan graph under the name its caller binds;
 //! the strata own the parts, the names and the order.
 //!
@@ -10,6 +10,7 @@
 //! below that weight is lifted to it first.
 
 use flowlog_parser::Mutability;
+use flowlog_planner::planner::HeadOperation;
 use flowlog_profiler::PlanGraph;
 use flowlog_profiler::with_plan_graph;
 use proc_macro2::Ident;
@@ -21,23 +22,19 @@ use crate::CodegenError;
 use crate::ty::diff::weight_tokens;
 
 impl Codegen {
-    /// Returns the union of `parts`, each a binding at its weight, as
-    /// relation `idb_fp`'s rows, and the relation's weight: the most
-    /// mutable part's. A plain relation's union is dedupped,
-    /// `flowlog_dedup(<union>)`; a lattice relation's is not, as the merge
-    /// that follows keys the rows by the lattice key and is idempotent, so
-    /// a dedup by the whole row would only arrange the rows once more.
-    /// Records the step in the plan graph as producing `output`, the name
-    /// the caller binds the expression to, where `recursive` says it sits
-    /// inside a loop. A relation with no part is a planner bug, reported
-    /// as an internal error.
+    /// Unions `parts` at their most mutable weight, then applies the
+    /// planned head `operation`. Records the runtime steps under `output`,
+    /// inside a loop when `recursive` is true.
     ///
-    /// A presence part may announce a row more than once, each announcement
-    /// lifting to its own count, but the dedup clamps every count to one.
-    pub(crate) fn gen_union(
+    /// # Errors
+    ///
+    /// Returns an internal error when the head has no inputs or a planned
+    /// aggregation has no declared relation.
+    pub(crate) fn gen_head(
         &self,
         idb_fp: u64,
         parts: &[(Ident, Mutability)],
+        operation: HeadOperation,
         output: &Ident,
         recursive: bool,
         plan_graph: &mut Option<PlanGraph>,
@@ -48,7 +45,10 @@ impl Codegen {
                 "relation `{name}` has no collections to union"
             )));
         };
-        let dedup = !self.program.is_lattice(idb_fp);
+        let dedup = match operation {
+            HeadOperation::Dedup => true,
+            HeadOperation::Aggregation => false,
+        };
         let mutability = rest
             .iter()
             .map(|(_, part)| *part)
@@ -92,12 +92,15 @@ impl Codegen {
             );
         });
 
-        let rows = if dedup {
-            quote! { ::flowlog_runtime::operators::flowlog_dedup(#union) }
-        } else {
-            union
-        };
-        Ok((rows, mutability))
+        match operation {
+            HeadOperation::Dedup => Ok((
+                quote! { ::flowlog_runtime::operators::flowlog_dedup(#union) },
+                mutability,
+            )),
+            HeadOperation::Aggregation => {
+                self.gen_lattice_merge(idb_fp, union, mutability, output, plan_graph)
+            }
+        }
     }
 }
 
@@ -162,7 +165,14 @@ mod tests {
         let parts: Vec<(Ident, Mutability)> =
             parts.into_iter().map(|(p, m)| (ident(p), m)).collect();
         let (deduped, found) = codegen
-            .gen_union(s, &parts, &ident("r"), false, &mut None)
+            .gen_head(
+                s,
+                &parts,
+                HeadOperation::Dedup,
+                &ident("r"),
+                false,
+                &mut None,
+            )
             .expect("parts to union");
         assert_eq!(
             (deduped.to_string(), found),
@@ -170,9 +180,8 @@ mod tests {
         );
     }
 
-    /// A lattice relation's union is not dedupped: its merge makes the set.
     #[test]
-    fn a_lattice_relations_union_is_not_dedupped() {
+    fn an_aggregation_head_merges_without_a_whole_row_dedup() {
         let codegen = codegen(LATTICE_PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
         let parts = [
@@ -180,12 +189,28 @@ mod tests {
             (ident("t_2"), Mutability::Static),
         ];
         let (rows, found) = codegen
-            .gen_union(s, &parts, &ident("r"), false, &mut None)
+            .gen_head(
+                s,
+                &parts,
+                HeadOperation::Aggregation,
+                &ident("r"),
+                false,
+                &mut None,
+            )
             .expect("parts to union");
         assert_eq!(
             (rows.to_string(), found),
             (
-                quote! { t_1.clone().concatenate([t_2.clone()]) }.to_string(),
+                quote! {
+                    ::flowlog_runtime::operators::flowlog_lattice(
+                        t_1.clone().concatenate([t_2.clone()]),
+                        "Merge: S",
+                        ::flowlog_runtime::operators::Min,
+                        |(x0, x1)| ((x0,), x1),
+                        |(k0,), v: i32| (k0, v),
+                    )
+                }
+                .to_string(),
                 Mutability::Static
             )
         );
@@ -198,7 +223,7 @@ mod tests {
         let codegen = codegen(PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
         let error = codegen
-            .gen_union(s, &[], &ident("r"), false, &mut None)
+            .gen_head(s, &[], HeadOperation::Dedup, &ident("r"), false, &mut None)
             .expect_err("nothing to union");
         assert!(matches!(error, CodegenError::Internal(_)));
     }
