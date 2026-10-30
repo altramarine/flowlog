@@ -6,7 +6,7 @@ use std::fmt;
 
 use flowlog_parser::Relation;
 
-use crate::planner::HeadOperation;
+use crate::planner::BindingOperation;
 use crate::planner::Transformation;
 
 // =============================================================================
@@ -76,16 +76,16 @@ pub(super) enum PhysicalArrangement {
 
 impl PhysicalArrangement {
     #[must_use]
-    pub(super) fn head(
+    pub(super) fn relation_binding(
         declaration: &Relation,
-        operation: &HeadOperation,
+        operation: &BindingOperation,
         stratum: usize,
         scope: Scope,
     ) -> Self {
         let relation = declaration.fingerprint();
         let columns = declaration.arity();
         match operation {
-            HeadOperation::Aggregation => {
+            BindingOperation::Aggregation => {
                 let target = declaration.lattice().map(|(target, _)| target);
                 Self::Aggregation {
                     stratum,
@@ -99,7 +99,7 @@ impl PhysicalArrangement {
                     },
                 }
             }
-            HeadOperation::Dedup { order } => Self::Dedup {
+            BindingOperation::Dedup { order } => Self::Dedup {
                 stratum,
                 scope,
                 relation,
@@ -155,7 +155,8 @@ impl fmt::Debug for Producer<'_> {
 // =============================================================================
 
 /// One input expression builds one output arrangement. A join keeps both
-/// ordered sources in its expression; a head keeps every union feed.
+/// ordered sources in its expression; a relation binding keeps every
+/// union feed.
 #[derive(Debug)]
 pub(super) struct Edge<'plan> {
     pub(super) input: Producer<'plan>,
@@ -198,9 +199,9 @@ mod tests {
             "#,
         ));
         let declaration = program.relation_by_fingerprint(compute_fp("r")).unwrap();
-        let node = PhysicalArrangement::head(
+        let node = PhysicalArrangement::relation_binding(
             declaration,
-            &HeadOperation::Aggregation,
+            &BindingOperation::Aggregation,
             0,
             Scope::NonRecursive,
         );
@@ -221,9 +222,9 @@ mod tests {
             "#,
         );
         let declaration = program.relation_by_fingerprint(compute_fp("r")).unwrap();
-        let node = PhysicalArrangement::head(
+        let node = PhysicalArrangement::relation_binding(
             declaration,
-            &HeadOperation::Dedup {
+            &BindingOperation::Dedup {
                 order: vec![0, 1, 2],
             },
             0,

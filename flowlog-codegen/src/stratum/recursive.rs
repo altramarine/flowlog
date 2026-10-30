@@ -2,7 +2,7 @@
 //! steps run in, emitted in six phases that read in the order of the code
 //! they produce. Each phase leaves bindings in a [`Recursion`] for the
 //! next: the collections that enter, the feedback variables, the bodies,
-//! each relation's head, the feedback, and the leave.
+//! each relation's binding, the feedback, and the leave.
 
 use std::collections::HashMap;
 
@@ -29,7 +29,7 @@ use crate::ty::diff::weight_tokens;
 /// phase leaves for the next, by the fingerprint of the relation or
 /// collection they hold.
 struct Recursion {
-    /// The weight every head shares, which picks the loop's time.
+    /// The weight every relation binding shares, which picks the loop's time.
     mutability: Mutability,
     /// `in_X` for each relation or arrangement `X` that enters the loop.
     entered: HashMap<u64, Ident>,
@@ -42,10 +42,10 @@ struct Recursion {
     /// Every binding a body reads: the entered ones, then the variables,
     /// which shadow an entered feedback relation.
     local_fp_to_ident: HashMap<u64, Ident>,
-    /// `next_X` for each relation once its head step has built it: the
-    /// union of every head with the entered binding, which the recursion
-    /// feeds back and leaves.
-    heads: HashMap<u64, Ident>,
+    /// `next_X` for each relation once its binding has been built: the
+    /// union of its rule results with the entered seed, after the binding
+    /// operation. The recursion feeds back and leaves this binding.
+    bindings: HashMap<u64, Ident>,
 }
 
 impl Recursion {
@@ -57,17 +57,17 @@ impl Recursion {
             arranged: HashMap::new(),
             variables: HashMap::new(),
             local_fp_to_ident: HashMap::new(),
-            heads: HashMap::new(),
+            bindings: HashMap::new(),
         }
     }
 
-    /// Returns relation `fp`'s bindings in `heads`, or an internal error
-    /// when it has none: every relation the recursion feeds back or leaves
-    /// is one of its heads.
-    fn head(&self, fp: u64) -> Result<&Ident, CodegenError> {
-        self.heads.get(&fp).ok_or_else(|| {
+    /// Returns relation `fp`'s completed binding, or an internal error
+    /// when it has none. Every relation the recursion feeds back or leaves
+    /// must have a completed binding.
+    fn binding(&self, fp: u64) -> Result<&Ident, CodegenError> {
+        self.bindings.get(&fp).ok_or_else(|| {
             CodegenError::internal(format!(
-                "relation fingerprint 0x{fp:016x} has no head binding in its loop"
+                "relation fingerprint 0x{fp:016x} has no completed binding in its loop"
             ))
         })
     }
@@ -97,8 +97,8 @@ impl Codegen {
             return Ok(quote! { #(#prelude)* });
         }
 
-        // Every head of a recursive stratum has the same mutability, which
-        // with the engine picks the loop's time.
+        // Every relation binding in a recursive stratum has the same weight,
+        // which with the engine picks the loop's time.
         let mutability = self.recursive_mutability(stratum)?;
         let (inner_time, step) = self.inner_time_tokens(mutability)?;
         let mut recursion = Recursion::new(mutability);
@@ -132,9 +132,9 @@ impl Codegen {
             })
             .collect::<Result<_, _>>()?;
 
-        // Phase 4: each relation's head, `next_X`, which the feedback and
+        // Phase 4: each relation's binding, `next_X`, which the feedback and
         // the leave read.
-        let head_stmts = self.gen_heads(stratum, &mut recursion, plan_graph)?;
+        let binding_stmts = self.gen_relation_bindings(stratum, &mut recursion, plan_graph)?;
 
         // Phase 5: feedback, `recursive_X_var.set(next_X)`.
         let set_stmts = self.gen_feedback(stratum, &recursion, plan_graph)?;
@@ -152,7 +152,7 @@ impl Codegen {
                 #(#enter_stmts)*
                 #(#variable_stmts)*
                 #(#body_stmts)*
-                #(#head_stmts)*
+                #(#binding_stmts)*
                 #(#set_stmts)*
                 #leave_expr
             }
@@ -235,11 +235,10 @@ impl Codegen {
         stmts
     }
 
-    /// Returns the head step of every relation of `stratum`, binding each
-    /// relation's head in `recursion`: `next_<fp>`, the union of all its
-    /// heads with its entered binding, merged by its lattice column when
-    /// it has one.
-    fn gen_heads(
+    /// Returns each relation's binding in `stratum` as `next_<fp>`,
+    /// applying its planned operation to the union of its rule results
+    /// and entered seed. Records the completed bindings in `recursion`.
+    fn gen_relation_bindings(
         &self,
         stratum: &StratumPlanner,
         recursion: &mut Recursion,
@@ -247,36 +246,37 @@ impl Codegen {
     ) -> Result<Vec<TokenStream>, CodegenError> {
         let mutability = recursion.mutability;
         let mut stmts = Vec::new();
-        for (idb_fp, head_plan) in stratum.heads() {
+        for (idb_fp, binding_plan) in stratum.relation_bindings() {
             let name = self.display_name(*idb_fp);
             let next = format_ident!("next_{idb_fp}");
-            let parts = self.recursive_parts(recursion, head_plan.seed(), head_plan.inputs())?;
-            let (head, found) = self.gen_head(
+            let parts =
+                self.recursive_parts(recursion, binding_plan.seed(), binding_plan.inputs())?;
+            let (rows, found) = self.gen_relation_binding(
                 *idb_fp,
                 &parts,
-                head_plan.operation(),
+                binding_plan.operation(),
                 &next,
-                true,
+                /*recursive*/ true,
                 plan_graph,
             )?;
             // The stratifier assigns the relation the same value on its own
-            // (Lemma 4 of `docs/design/mutability.md`), and every head of
-            // the loop shares the loop's weight.
+            // (Lemma 4 of `docs/design/mutability.md`), and every relation
+            // binding of the loop shares the loop's weight.
             debug_assert_eq!(
                 stratum.mutability(*idb_fp),
                 Some(found),
                 "`{name}` binds at a weight the stratifier does not give it",
             );
             debug_assert_eq!(found, mutability, "`{name}` binds off the loop's weight");
-            stmts.push(quote! { let #next = #head; });
-            recursion.heads.insert(*idb_fp, next);
+            stmts.push(quote! { let #next = #rows; });
+            recursion.bindings.insert(*idb_fp, next);
         }
         Ok(stmts)
     }
 
     /// Returns `recursive_X_var.set(next_X);` for each feedback relation of
-    /// `stratum`, in order, feeding its head in `recursion` back into the
-    /// loop.
+    /// `stratum`, in order, feeding its completed binding in `recursion`
+    /// back into the loop.
     fn gen_feedback(
         &self,
         stratum: &StratumPlanner,
@@ -285,7 +285,7 @@ impl Codegen {
     ) -> Result<Vec<TokenStream>, CodegenError> {
         let mut stmts = Vec::new();
         for fp in stratum.recursion_feedback_collections() {
-            let next = recursion.head(*fp)?;
+            let next = recursion.binding(*fp)?;
             let variable = recursion.variables.get(fp).ok_or_else(|| {
                 CodegenError::internal(format!(
                     "feedback relation fingerprint 0x{fp:016x} has no variable"
@@ -333,7 +333,7 @@ impl Codegen {
                 continue;
             }
             let folded = format_ident!("folded_{fp}");
-            let fold = self.gen_lattice_fold(*fp, recursion.head(*fp)?, &folded, plan_graph)?;
+            let fold = self.gen_lattice_fold(*fp, recursion.binding(*fp)?, &folded, plan_graph)?;
             folds.push(Some((folded, fold)));
         }
 
@@ -345,7 +345,7 @@ impl Codegen {
         let mut leave_exprs = Vec::with_capacity(leave_fps.len());
         for ((fp, target), fold) in leave_fps.iter().zip(&targets).zip(folds) {
             let name = self.display_name(*fp);
-            let next = recursion.head(*fp)?;
+            let next = recursion.binding(*fp)?;
             leave_exprs.push(match fold {
                 Some((folded, fold)) => {
                     with_plan_graph(plan_graph, |plan_graph| {
@@ -382,9 +382,9 @@ impl Codegen {
 // =============================================================================
 
 impl Codegen {
-    /// Returns the mutability every collection the loop body of `stratum`
-    /// produces shares, which is its heads' too. Each such collection reads
-    /// a feedback variable, directly or through another, and the planner
+    /// Returns the mutability shared by the loop body collections and
+    /// relation bindings of `stratum`. Each body collection reads a
+    /// feedback variable, directly or through another, and the planner
     /// factors everything else out as the stratum's prelude; so in a mutable
     /// loop only collections entered from outside can be static. A body
     /// whose collections disagree, or that has none, is a planner bug,
@@ -411,30 +411,32 @@ impl Codegen {
         Ok(mutability)
     }
 
-    /// Resolves a head's planned union inputs inside `recursion`: its
-    /// entered seed, at the weight it entered with,
-    /// then the heads `head_fps` as the recursion binds them. A head the
-    /// recursion produces, or a feedback relation a rule reads as it is,
-    /// is at the recursion's weight, whatever weight the relation's
-    /// earlier binding recorded; any other head at the weight recorded
-    /// for it.
+    /// Returns a relation's seed followed by its rule results, with their
+    /// scope's weights. An entered seed keeps its outer weight; feedback
+    /// results use the recursion's weight, and other results keep their
+    /// recorded weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error if the seed has no entered binding or an
+    /// input has no recorded weight.
     fn recursive_parts(
         &self,
         recursion: &Recursion,
         seed: Option<u64>,
-        head_fps: &[u64],
+        rule_outputs: &[u64],
     ) -> Result<Vec<(Ident, Mutability)>, CodegenError> {
         let entered = seed.map(|fp| {
             let binding = recursion.entered.get(&fp).ok_or_else(|| {
                 CodegenError::internal(format!(
-                    "planned head seed 0x{fp:016x} has no entered binding"
+                    "planned relation seed 0x{fp:016x} has no entered binding"
                 ))
             })?;
             Ok((binding.clone(), self.mutability(fp)?))
         });
         entered
             .into_iter()
-            .chain(head_fps.iter().map(|fp| {
+            .chain(rule_outputs.iter().map(|fp| {
                 let weight = if recursion.variables.contains_key(fp) {
                     recursion.mutability
                 } else {
@@ -461,13 +463,50 @@ mod tests {
         Ident::new(name, Span::call_site())
     }
 
-    /// Inside a mutable recursion, a relation's entered binding keeps the
-    /// static weight it entered with, so the union lifts it, while a
-    /// feedback relation read as a head is at the recursion's weight
-    /// whatever its earlier binding recorded, and any other head at its
-    /// own.
+    /// Seed absence is resolved before token emission; inspect bindings
+    /// directly instead of reconstructing them from generated Rust.
     #[test]
-    fn recursive_parts_weigh_the_entered_binding_and_the_heads_apart() {
+    fn a_recursive_binding_without_a_seed_uses_its_rule_results() {
+        let codegen = codegen(PROGRAM);
+        let relation = codegen.program.idbs()[0].fingerprint();
+        let mut recursion = Recursion::new(Mutability::Mutable);
+        recursion.variables.insert(relation, ident("recursive_s"));
+        recursion
+            .local_fp_to_ident
+            .insert(relation, ident("recursive_s"));
+        let parts = codegen
+            .recursive_parts(&recursion, None, &[relation])
+            .expect("the rule reads feedback without an outer seed");
+        assert_eq!(parts, vec![(ident("recursive_s"), Mutability::Mutable)]);
+    }
+
+    /// Completed plans cannot contain an unresolved seed, so exercise the
+    /// resolver directly to verify rejection at the codegen boundary.
+    #[test]
+    fn a_recursive_seed_without_an_entered_binding_is_an_internal_error() {
+        let codegen = codegen(PROGRAM);
+        let relation = 0x7;
+        let mut recursion = Recursion::new(Mutability::Mutable);
+        recursion.variables.insert(relation, ident("recursive_s"));
+        recursion
+            .local_fp_to_ident
+            .insert(relation, ident("recursive_s"));
+        let error = codegen
+            .recursive_parts(&recursion, Some(relation), &[relation])
+            .expect_err("feedback cannot substitute for an entered seed");
+        assert!(matches!(&error, CodegenError::Internal(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("planned relation seed 0x0000000000000007 has no entered binding"),
+            "{error}"
+        );
+    }
+
+    /// Per-input weights are resolved before emission; inspect scope
+    /// bindings directly to distinguish a static seed from feedback.
+    #[test]
+    fn recursive_parts_weigh_the_entered_binding_and_rule_results_apart() {
         let mut codegen = codegen(PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
         let r = codegen.program.edbs()[0].fingerprint();

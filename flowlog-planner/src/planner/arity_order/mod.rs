@@ -39,7 +39,8 @@ pub(super) fn optimize(
     // TODO: Step 2: build legal layout domains and costs from the fused
     // feeds. Couple each join's input key orders and orientation to its
     // output; all union feeds share the target's layout. Extract the
-    // sorting boundaries of aggregation operators and heads before solving.
+    // sorting boundaries of aggregation operators and relation bindings
+    // before solving.
     // Resolve external schemas before solving.
     // Keep downstream choices fixed and include their conversion costs;
     // an enter or feedback edge does not create an arrangement.

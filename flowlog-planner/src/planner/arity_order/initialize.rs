@@ -38,7 +38,7 @@ pub(super) fn initialize<'plan>(
     program: &Program,
 ) -> Graph<'plan> {
     let mut graph = Graph::default();
-    // A head can add rules to a relation already bound by an earlier
+    // A relation can gain rule results after being bound by an earlier
     // stratum. Preserve that binding even if no body reads the relation.
     let earlier_relations = upstream.iter().flat_map(StratumPlanner::output_relations);
     let mut bindings: Bindings<'plan> = program
@@ -57,11 +57,11 @@ pub(super) fn initialize<'plan>(
 
 /// Adds one stratum's arrangement graph without changing its plan.
 /// `bindings` maps available outer collection fingerprints to their
-/// producers. It gains prelude results and non-recursive heads; from a
-/// recursive body, only the heads leaving the loop are published.
+/// producers. It gains prelude results and non-recursive relation results.
+/// From a recursive body, only results leaving the loop are published.
 ///
-/// Each relation head is one dedup or aggregation node fed by its rule
-/// results and any earlier seed. Recursive reads reference that head,
+/// Each relation binding is one dedup or aggregation node fed by its rule
+/// results and any earlier seed. Recursive reads reference that binding,
 /// forming a graph cycle rather than unrolling iterations. The seed
 /// retains its outer producer even when feedback names the same relation.
 fn initialize_stratum<'plan>(
@@ -71,8 +71,8 @@ fn initialize_stratum<'plan>(
     bindings: &mut Bindings<'plan>,
     graph: &mut Graph<'plan>,
 ) {
-    // Heads and loop entries can read prelude results, so resolve those
-    // producers before rebinding any relation to its head.
+    // Relation bindings and loop entries can read prelude results, so resolve
+    // those producers before replacing any earlier relation binding.
     initialize_transformations(
         index,
         Scope::NonRecursive,
@@ -83,27 +83,28 @@ fn initialize_stratum<'plan>(
     );
 
     if !stratum.is_recursive() {
-        // All heads read the incoming bindings and the completed prelude.
-        // Publish heads afterwards so map iteration cannot change lineage.
-        let mut heads = BTreeMap::new();
+        // All results read the incoming bindings and the completed prelude.
+        // Publish them together so map iteration cannot change lineage.
+        let mut relation_results = BTreeMap::new();
         for declaration in program.relations() {
             let relation = declaration.fingerprint();
-            let Some(head) = stratum.heads().get(&relation) else {
+            let Some(binding) = stratum.relation_bindings().get(&relation) else {
                 continue;
             };
-            let node = PhysicalArrangement::head(
+            let node = PhysicalArrangement::relation_binding(
                 declaration,
-                head.operation(),
+                binding.operation(),
                 index,
                 Scope::NonRecursive,
             );
-            let mut parts: Vec<Producer<'plan>> = head
+            let mut parts: Vec<Producer<'plan>> = binding
                 .seed()
                 .map(|seed| resolve_producer(seed, bindings, None))
                 .into_iter()
                 .collect();
             parts.extend(
-                head.inputs()
+                binding
+                    .inputs()
                     .iter()
                     .map(|&fingerprint| resolve_producer(fingerprint, bindings, None)),
             );
@@ -112,9 +113,9 @@ fn initialize_stratum<'plan>(
                 input: Producer::Union(parts),
                 output: node.clone(),
             });
-            heads.insert(relation, Producer::Arrangement(node));
+            relation_results.insert(relation, Producer::Arrangement(node));
         }
-        bindings.extend(heads);
+        bindings.extend(relation_results);
         return;
     }
 
@@ -129,26 +130,30 @@ fn initialize_stratum<'plan>(
         .map(|&fingerprint| (fingerprint, resolve_producer(fingerprint, bindings, None)))
         .collect();
     // Keep the seed bindings separate: feedback must shadow body reads
-    // of R without replacing the outer R that feeds the head's union.
+    // of R without replacing the outer R that feeds the binding's union.
     let mut recursive_bindings = entered.clone();
-    let mut heads = BTreeMap::new();
-    // Reserve head identities before the body so its feedback sources
+    let mut relation_results = BTreeMap::new();
+    // Reserve binding identities before the body so its feedback sources
     // can reference nodes whose incoming edges have not been filled yet.
     for declaration in program.relations() {
         let relation = declaration.fingerprint();
-        let Some(head) = stratum.heads().get(&relation) else {
+        let Some(binding) = stratum.relation_bindings().get(&relation) else {
             continue;
         };
-        let node =
-            PhysicalArrangement::head(declaration, head.operation(), index, Scope::Recursive);
+        let node = PhysicalArrangement::relation_binding(
+            declaration,
+            binding.operation(),
+            index,
+            Scope::Recursive,
+        );
         graph.nodes.insert(node.clone());
-        heads.insert(relation, Producer::Arrangement(node));
+        relation_results.insert(relation, Producer::Arrangement(node));
     }
-    // A recursive feed references the head arrangement directly; neither
+    // A recursive feed references the binding arrangement directly; neither
     // entering a scope nor feeding back rows builds another arrangement.
     for &relation in stratum.recursion_feedback_collections() {
-        if let Some(head) = heads.get(&relation) {
-            recursive_bindings.insert(relation, head.clone());
+        if let Some(binding) = relation_results.get(&relation) {
+            recursive_bindings.insert(relation, binding.clone());
         }
     }
     initialize_transformations(
@@ -161,18 +166,22 @@ fn initialize_stratum<'plan>(
     );
     for declaration in program.relations() {
         let relation = declaration.fingerprint();
-        let Some(head) = stratum.heads().get(&relation) else {
+        let Some(binding) = stratum.relation_bindings().get(&relation) else {
             continue;
         };
-        let node =
-            PhysicalArrangement::head(declaration, head.operation(), index, Scope::Recursive);
-        let mut parts: Vec<Producer<'plan>> = head
+        let node = PhysicalArrangement::relation_binding(
+            declaration,
+            binding.operation(),
+            index,
+            Scope::Recursive,
+        );
+        let mut parts: Vec<Producer<'plan>> = binding
             .seed()
             .and_then(|seed| entered.get(&seed))
             .cloned()
             .into_iter()
             .collect();
-        parts.extend(head.inputs().iter().map(|&fingerprint| {
+        parts.extend(binding.inputs().iter().map(|&fingerprint| {
             resolve_producer(fingerprint, &recursive_bindings, Some(bindings))
         }));
         graph.edges.push(Edge {
@@ -181,10 +190,10 @@ fn initialize_stratum<'plan>(
         });
     }
     // Loop-local arrangements must not alias later arrangements of the
-    // completed rows, so only leaving heads become outer bindings.
+    // completed rows, so only results leaving the loop become outer bindings.
     for &relation in stratum.recursion_leave_collections() {
-        if let Some(head) = heads.get(&relation) {
-            bindings.insert(relation, head.clone());
+        if let Some(binding) = relation_results.get(&relation) {
+            bindings.insert(relation, binding.clone());
         }
     }
 }
@@ -387,7 +396,7 @@ mod tests {
     use flowlog_parser::test_harness::program;
 
     use super::*;
-    use crate::planner::HeadOperation;
+    use crate::planner::BindingOperation;
     use crate::planner::ProgramPlanner;
 
     /// Sharing reads S0's (b,c) stream to build S1's (c) index. Fuse that
@@ -462,7 +471,7 @@ mod tests {
             })
             .expect("Mid's dedup");
         let Producer::Union(parts) = &mid.input else {
-            panic!("Mid's head retains its union feeds");
+            panic!("Mid's binding retains its union feeds");
         };
         let [Producer::Transformation { step, .. }] = parts.as_slice() else {
             panic!("Mid has one projection feed");
@@ -500,21 +509,24 @@ mod tests {
             .iter()
             .map(|relation| (relation.fingerprint(), relation))
             .collect();
-        let mut planned = StratumPlanner::from_stratum(
+        let mut stratum = StratumPlanner::from_stratum(
             &program,
             &stratifier.strata()[0],
             &mut optimizer,
             &mut None,
             &[],
             &declarations,
+            &program.edb_fingerprints(),
         )
         .expect("planned");
-        planned.bind_head_seeds(&program.edb_fingerprints());
-        let stratum = &mut planned;
-        stratum.heads.get_mut(&compute_fp("r")).unwrap().operation = HeadOperation::Dedup {
+        stratum
+            .relation_bindings
+            .get_mut(&compute_fp("r"))
+            .unwrap()
+            .operation = BindingOperation::Dedup {
             order: vec![2, 0, 1],
         };
-        let graph = initialize(stratum, &[], &[], &program);
+        let graph = initialize(&stratum, &[], &[], &program);
         assert!(graph.nodes.contains(&PhysicalArrangement::Dedup {
             stratum: 0,
             scope: Scope::NonRecursive,
@@ -527,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_stratums_head_keeps_earlier_contributions() {
+    fn a_later_stratums_binding_keeps_earlier_contributions() {
         let program = program(
             r#"
             .decl E(x: int32)
@@ -549,7 +561,7 @@ mod tests {
             panic!("the Aux dependency separates two strata");
         };
         let graph = initialize(downstream, std::slice::from_ref(upstream), &[], &program);
-        let head = graph
+        let binding = graph
             .edges
             .iter()
             .find(|edge| {
@@ -565,15 +577,15 @@ mod tests {
                     }
             })
             .expect("R's later dedup");
-        let Producer::Union(parts) = &head.input else {
-            panic!("R's head retains its union feeds");
+        let Producer::Union(parts) = &binding.input else {
+            panic!("R's binding retains its union feeds");
         };
         let [
             Producer::External(seed),
             Producer::Transformation { step, .. },
         ] = parts.as_slice()
         else {
-            panic!("R's head must union its earlier binding with the new join");
+            panic!("R's binding must union its earlier binding with the new join");
         };
         assert_eq!(*seed, compute_fp("r"));
         assert!(matches!(step.as_ref(), Transformation::JnToRow { .. }));
@@ -614,7 +626,7 @@ mod tests {
             })
             .expect("Out's dedup");
         let Producer::Union(parts) = &out.input else {
-            panic!("Out's head retains its union feeds");
+            panic!("Out's binding retains its union feeds");
         };
         let [Producer::Transformation { step, sources }] = parts.as_slice() else {
             panic!("Out has one projection feed");
