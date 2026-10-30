@@ -1,7 +1,7 @@
 //! Unions: the step a stratum chains to bind a relation from its parts,
 //! the collections its rules produce for it and its earlier binding, each
-//! at the weight the stratum gives it. [`Codegen::gen_union`] unions them
-//! into one expression, applying the planned head operation, and
+//! at the weight the stratum gives it. [`Codegen::gen_head`] unions them
+//! into one expression and applies the planned dedup or aggregation. It
 //! records the step in the plan graph under the name its caller binds;
 //! the strata own the parts, the names and the order.
 //!
@@ -24,13 +24,15 @@ use crate::tuple_tokens;
 use crate::ty::diff::weight_tokens;
 
 impl Codegen {
-    /// Returns the union of `parts` at their most mutable weight, with
-    /// the planner's `operation`: a whole-row dedup in the selected order,
-    /// or unchanged rows for the declared aggregation that follows.
-    /// Records the runtime steps under `output`, inside a loop when
-    /// `recursive` is true. Reports an internal error for no inputs or
-    /// an invalid dedup permutation.
-    pub(crate) fn gen_union(
+    /// Unions `parts` at their most mutable weight, then applies the
+    /// planned head `operation`. Records the runtime steps under `output`,
+    /// inside a loop when `recursive` is true.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the head has no inputs, a dedup
+    /// order is invalid, or an aggregation has no declared relation.
+    pub(crate) fn gen_head(
         &self,
         idb_fp: u64,
         parts: &[(Ident, Mutability)],
@@ -97,7 +99,12 @@ impl Codegen {
             );
         });
 
-        Ok((rows, mutability))
+        match operation {
+            HeadOperation::Dedup { .. } => Ok((rows, mutability)),
+            HeadOperation::Aggregation => {
+                self.gen_lattice_merge(idb_fp, rows, mutability, output, plan_graph)
+            }
+        }
     }
 
     /// Applies the planned whole-row comparator while keeping the logical
@@ -213,7 +220,7 @@ mod tests {
         let parts: Vec<(Ident, Mutability)> =
             parts.into_iter().map(|(p, m)| (ident(p), m)).collect();
         let (deduped, found) = codegen
-            .gen_union(
+            .gen_head(
                 s,
                 &parts,
                 &HeadOperation::Dedup { order: vec![0] },
@@ -268,9 +275,8 @@ mod tests {
         assert!(matches!(error, CodegenError::Internal(_)));
     }
 
-    /// A lattice relation's union is not dedupped: its merge makes the set.
     #[test]
-    fn a_lattice_relations_union_is_not_dedupped() {
+    fn an_aggregation_head_merges_without_a_whole_row_dedup() {
         let codegen = codegen(LATTICE_PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
         let parts = [
@@ -278,7 +284,7 @@ mod tests {
             (ident("t_2"), Mutability::Static),
         ];
         let (rows, found) = codegen
-            .gen_union(
+            .gen_head(
                 s,
                 &parts,
                 &HeadOperation::Aggregation,
@@ -290,7 +296,16 @@ mod tests {
         assert_eq!(
             (rows.to_string(), found),
             (
-                quote! { t_1.clone().concatenate([t_2.clone()]) }.to_string(),
+                quote! {
+                    ::flowlog_runtime::operators::flowlog_lattice(
+                        t_1.clone().concatenate([t_2.clone()]),
+                        "Merge: S",
+                        ::flowlog_runtime::operators::Min,
+                        |(x0, x1)| ((x0,), x1),
+                        |(k0,), v: i32| (k0, v),
+                    )
+                }
+                .to_string(),
                 Mutability::Static
             )
         );
@@ -303,7 +318,7 @@ mod tests {
         let codegen = codegen(PROGRAM);
         let s = codegen.program.idbs()[0].fingerprint();
         let error = codegen
-            .gen_union(
+            .gen_head(
                 s,
                 &[],
                 &HeadOperation::Dedup { order: vec![0] },

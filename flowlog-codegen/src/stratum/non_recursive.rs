@@ -45,7 +45,7 @@ impl Codegen {
                         .map(|fp| Ok((self.find_global_ident(*fp), self.mutability(*fp)?))),
                 )
                 .collect::<Result<_, CodegenError>>()?;
-            let (rows, rows_mutability) = self.gen_union(
+            let (head, mutability) = self.gen_head(
                 *idb_fp,
                 &parts,
                 head_plan.operation(),
@@ -53,8 +53,6 @@ impl Codegen {
                 false,
                 plan_graph,
             )?;
-            let (head, mutability) =
-                self.gen_lattice_merge(*idb_fp, rows, rows_mutability, &binding, plan_graph)?;
             // The stratifier assigns the relation the same value on its own;
             // the two derivations agree by Lemma 4 of
             // `docs/design/mutability.md`.

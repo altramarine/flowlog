@@ -1,8 +1,11 @@
 //! Whole-program planner: plans the strata in order, each sharing work
 //! with the ones before it.
 
+use std::collections::HashMap;
+
 use flowlog_common::BoxError;
 use flowlog_parser::Program;
+use flowlog_parser::Relation;
 use flowlog_profiler::PlanGraph;
 
 use crate::optimizer::Optimizer;
@@ -20,12 +23,18 @@ pub struct ProgramPlanner {
 impl ProgramPlanner {
     /// Runs the full planner pipeline against `program`: stratify, then
     /// build a [`StratumPlanner`] per stratum in order, each sharing the
-    /// collections the preludes before it compute.
+    /// collections the preludes before it compute. Indexes declarations
+    /// once so each stratum builds only the heads it produces.
     pub fn from_program(
         program: &Program,
         plan_graph: &mut Option<PlanGraph>,
     ) -> Result<Self, BoxError> {
         let stratifier = Stratifier::from_program(program).map_err(BoxError::from)?;
+        let declarations: HashMap<u64, &Relation> = program
+            .relations()
+            .iter()
+            .map(|relation| (relation.fingerprint(), relation))
+            .collect();
         let mut optimizer = Optimizer::new();
         let mut preludes: Vec<Transformation> = Vec::new();
         let mut strata = Vec::with_capacity(stratifier.strata().len());
@@ -37,6 +46,7 @@ impl ProgramPlanner {
                 &mut optimizer,
                 plan_graph,
                 &preludes,
+                &declarations,
             )
             .map_err(BoxError::from)?;
             planned.bind_head_seeds(&bound_relations);

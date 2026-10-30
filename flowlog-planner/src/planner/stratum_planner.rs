@@ -12,6 +12,7 @@ use flowlog_common::SUBSECTION_BAR;
 use flowlog_parser::FlowLogRule;
 use flowlog_parser::Mutability;
 use flowlog_parser::Program;
+use flowlog_parser::Relation;
 use flowlog_profiler::PlanGraph;
 use flowlog_profiler::with_plan_graph;
 use tracing::debug;
@@ -87,6 +88,7 @@ impl StratumPlanner {
         optimizer: &mut Optimizer,
         plan_graph: &mut Option<PlanGraph>,
         preludes: &[Transformation],
+        declarations: &HashMap<u64, &Relation>,
     ) -> Result<Self, PlanError> {
         let rules = program.rules();
         let stratum: Vec<FlowLogRule> = stratified
@@ -180,16 +182,17 @@ impl StratumPlanner {
                     .push(head.output().fingerprint());
             }
         }
-        let heads: HashMap<u64, HeadPlan> = program
-            .relations()
-            .iter()
-            .filter_map(|declaration| {
-                let relation = declaration.fingerprint();
-                head_inputs
-                    .remove(&relation)
-                    .map(|inputs| (relation, HeadPlan::new(declaration, inputs)))
+        let heads: HashMap<u64, HeadPlan> = head_inputs
+            .into_iter()
+            .map(|(relation, inputs)| {
+                let declaration = declarations.get(&relation).ok_or_else(|| {
+                    PlanError::internal(format!(
+                        "head relation 0x{relation:016x} has no declaration"
+                    ))
+                })?;
+                Ok((relation, HeadPlan::new(declaration, inputs)))
             })
-            .collect();
+            .collect::<Result<_, PlanError>>()?;
         let mut stratum_planner = Self {
             rule_planners,
             is_recursive,
@@ -272,13 +275,14 @@ impl StratumPlanner {
 
     /// Binds each head's earlier input before the stratum shadows it.
     pub(super) fn bind_head_seeds(&mut self, bound_relations: &HashSet<u64>) {
+        let entered: HashSet<u64> = self.recursion_enter_collections.iter().copied().collect();
+        let available = if self.is_recursive {
+            &entered
+        } else {
+            bound_relations
+        };
         for (&relation, head) in &mut self.heads {
-            let available = if self.is_recursive {
-                self.recursion_enter_collections.contains(&relation)
-            } else {
-                bound_relations.contains(&relation)
-            };
-            head.seed = available.then_some(relation);
+            head.seed = available.contains(&relation).then_some(relation);
         }
     }
 

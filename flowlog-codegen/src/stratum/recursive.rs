@@ -251,7 +251,7 @@ impl Codegen {
             let name = self.display_name(*idb_fp);
             let next = format_ident!("next_{idb_fp}");
             let parts = self.recursive_parts(recursion, head_plan.seed(), head_plan.inputs())?;
-            let (rows, rows_mutability) = self.gen_union(
+            let (head, found) = self.gen_head(
                 *idb_fp,
                 &parts,
                 head_plan.operation(),
@@ -259,8 +259,6 @@ impl Codegen {
                 true,
                 plan_graph,
             )?;
-            let (head, found) =
-                self.gen_lattice_merge(*idb_fp, rows, rows_mutability, &next, plan_graph)?;
             // The stratifier assigns the relation the same value on its own
             // (Lemma 4 of `docs/design/mutability.md`), and every head of
             // the loop shares the loop's weight.

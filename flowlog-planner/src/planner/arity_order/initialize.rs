@@ -495,12 +495,18 @@ mod tests {
         );
         let stratifier = crate::stratifier::Stratifier::from_program(&program).expect("stratified");
         let mut optimizer = crate::optimizer::Optimizer::new();
+        let declarations: std::collections::HashMap<u64, &flowlog_parser::Relation> = program
+            .relations()
+            .iter()
+            .map(|relation| (relation.fingerprint(), relation))
+            .collect();
         let mut planned = StratumPlanner::from_stratum(
             &program,
             &stratifier.strata()[0],
             &mut optimizer,
             &mut None,
             &[],
+            &declarations,
         )
         .expect("planned");
         planned.bind_head_seeds(&program.edb_fingerprints());

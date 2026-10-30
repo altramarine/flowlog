@@ -69,6 +69,7 @@ impl HeadPlan {
 #[cfg(test)]
 mod tests {
     use flowlog_common::compute_fp;
+    use rstest::rstest;
 
     use super::*;
     use crate::test_harness::program_planner;
@@ -93,17 +94,16 @@ mod tests {
         assert_eq!(head.inputs().len(), 1);
     }
 
-    #[test]
-    fn declared_aggregation_heads_do_not_plan_a_whole_row_dedup() {
-        let plan = program_planner(
-            r#"
-            .decl E(a: int32, b: int32)
-            .input E
-            .decl R(a: int32, b: min<int32>)
-            .output R
-            R(a,b) :- E(a,b).
-            "#,
-        );
+    // Cases: declared aggregation.
+    #[rstest]
+    #[case("min")]
+    #[case("max")]
+    fn declared_aggregation_heads_do_not_plan_a_whole_row_dedup(#[case] aggregate: &str) {
+        let plan = program_planner(&format!(
+            ".decl E(a: int32, b: int32)\n.input E\n\
+             .decl R(a: int32, b: {aggregate}<int32>)\n.output R\n\
+             R(a,b) :- E(a,b).\n"
+        ));
         let head = &plan.strata()[0].heads()[&compute_fp("r")];
         assert_eq!(head.operation(), &HeadOperation::Aggregation);
     }
@@ -133,6 +133,37 @@ mod tests {
                 .recursion_feedback_collections()
                 .contains(&relation)
         );
+    }
+
+    #[test]
+    fn a_later_non_recursive_head_keeps_the_earlier_binding() {
+        let plan = program_planner(
+            r#"
+            .decl E(x: int32)
+            .input E
+            .decl F(x: int32)
+            .input F
+            .decl G(x: int32)
+            .input G
+            .decl Aux(x: int32)
+            .decl R(x: int32)
+            .output R
+            Aux(x) :- G(x).
+            R(x) :- E(x).
+            R(x) :- Aux(x), F(x).
+            "#,
+        );
+        let [base, later] = plan.strata() else {
+            panic!("Aux separates the two rules for R into two strata");
+        };
+        let relation = compute_fp("r");
+        assert!(!base.is_recursive());
+        assert!(!later.is_recursive());
+        assert_eq!(base.heads()[&relation].seed(), None);
+        let head = &later.heads()[&relation];
+        assert_eq!(head.seed(), Some(relation));
+        assert_eq!(head.inputs().len(), 1);
+        assert!(!head.inputs().contains(&relation));
     }
 
     #[test]

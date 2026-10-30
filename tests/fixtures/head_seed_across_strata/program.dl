@@ -1,0 +1,13 @@
+.decl E(x: int32)
+.input E(IO="file", filename="E.csv")
+.decl F(x: int32)
+.input F(IO="file", filename="F.csv")
+.decl G(x: int32)
+.input G(IO="file", filename="G.csv")
+.decl Aux(x: int32)
+.decl R(x: int32)
+.output R
+
+Aux(x) :- G(x).
+R(x) :- E(x).
+R(x) :- Aux(x), F(x).
