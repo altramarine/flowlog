@@ -14,7 +14,9 @@ pub enum BindingOperation {
     Dedup { order: Vec<usize> },
     /// Merges the declared min/max column by every other column. Its
     /// idempotent merge consumes the union without a whole-row dedup.
-    Aggregation,
+    /// `order` lists every grouping column in physical key order; the
+    /// merged result restores logical column positions.
+    Aggregation { order: Vec<usize> },
 }
 
 // =============================================================================
@@ -55,8 +57,12 @@ pub struct RelationBindingPlan {
 impl RelationBindingPlan {
     #[must_use]
     pub(super) fn new(declaration: &Relation, inputs: Vec<u64>) -> Self {
-        let operation = if declaration.lattice().is_some() {
-            BindingOperation::Aggregation
+        let operation = if let Some((target, _)) = declaration.lattice() {
+            BindingOperation::Aggregation {
+                order: (0..declaration.arity())
+                    .filter(|&column| column != target)
+                    .collect(),
+            }
         } else {
             BindingOperation::Dedup {
                 order: (0..declaration.arity()).collect(),
@@ -100,8 +106,8 @@ mod tests {
     // Cases: declaration fields, binding operation.
     #[rstest]
     #[case::ordinary("a: int32, b: symbol", BindingOperation::Dedup { order: vec![0, 1] })]
-    #[case::minimum("a: int32, b: min<int32>", BindingOperation::Aggregation)]
-    #[case::maximum("a: int32, b: max<int32>", BindingOperation::Aggregation)]
+    #[case::minimum("a: int32, b: min<int32>", BindingOperation::Aggregation { order: vec![0] })]
+    #[case::maximum("a: int32, b: max<int32>", BindingOperation::Aggregation { order: vec![0] })]
     fn a_binding_selects_its_operation_from_the_declaration(
         #[case] fields: &str,
         #[case] expected: BindingOperation,

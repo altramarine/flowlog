@@ -49,11 +49,11 @@ pub struct StratumPlanner {
     /// Deduplicated transformations awaiting recursive partitioning.
     transformations: Vec<Transformation>,
 
-    /// Transformations that depend only on EDB inputs; computed once.
-    non_recursive_transformations: Vec<Transformation>,
+    /// Work independent of this stratum's feedback, including earlier IDBs.
+    pub(super) non_recursive_transformations: Vec<Transformation>,
 
-    /// Transformations that touch IDB inputs; re-run during recursion.
-    recursive_transformations: Vec<Transformation>,
+    /// Work that transitively depends on this stratum's feedback.
+    pub(super) recursive_transformations: Vec<Transformation>,
 
     /// Fingerprints of collections that enter recursion.
     recursion_enter_collections: Vec<u64>,
@@ -244,15 +244,15 @@ impl StratumPlanner {
 // Getters
 // =========================================================================
 impl StratumPlanner {
-    /// Get non-recursive transformations that depend only on EDBs.
-    /// These transformations can be computed once outside recursion.
+    /// Returns work evaluated outside this stratum's recursive scope.
+    #[must_use]
     #[inline]
     pub fn non_recursive_transformations(&self) -> &[Transformation] {
         &self.non_recursive_transformations
     }
 
-    /// Get dynamic transformations that depend on IDB collections.
-    /// These transformations must be re-evaluated during recursion.
+    /// Returns work evaluated within this stratum's recursive scope.
+    #[must_use]
     #[inline]
     pub fn recursive_transformations(&self) -> &[Transformation] {
         &self.recursive_transformations

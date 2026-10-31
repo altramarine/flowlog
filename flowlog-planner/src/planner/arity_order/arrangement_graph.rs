@@ -1,10 +1,8 @@
 //! Physical arrangements and the expressions that build them.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
-
-use flowlog_parser::Relation;
 
 use crate::planner::BindingOperation;
 use crate::planner::Transformation;
@@ -13,6 +11,7 @@ use crate::planner::Transformation;
 // Scope
 // =============================================================================
 
+/// Whether a boundary is outside or inside its stratum's feedback loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Scope {
     NonRecursive,
@@ -23,9 +22,9 @@ pub(super) enum Scope {
 // Arities
 // =============================================================================
 
-/// Sortable key and value blocks, as column positions in the feed's
-/// flattened output row. Aggregation contributions live in weights and
-/// are excluded; the aggregation's result row still contains its answer.
+/// Column positions in the feed's flattened row, grouped into key and value
+/// blocks. The key precedes the value. Variable boundaries may reorder fields
+/// within a block; fixed boundaries retain the listed order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Arities {
     pub(super) key: Vec<usize>,
@@ -50,66 +49,68 @@ impl Arities {
 /// One materialized layout, including dedup and aggregation results. Static
 /// dedup is a sorting boundary even when consolidation retains no trace.
 /// Stratum zero is current; later indices follow evaluation order.
-/// `arities` names the field blocks whose internal orders can change.
+/// Its identity stays unchanged when a selected field order changes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PhysicalArrangement {
     Arrangement {
         stratum: usize,
         scope: Scope,
         transformation: usize,
-        arities: Arities,
     },
     /// All union feeds share this node's single dedup layout.
     Dedup {
         stratum: usize,
         scope: Scope,
         relation: u64,
-        arities: Arities,
     },
     Aggregation {
         stratum: usize,
         scope: Scope,
         relation: u64,
-        arities: Arities,
     },
 }
 
 impl PhysicalArrangement {
+    /// Identifies a completed binding independently of its selected order.
     #[must_use]
     pub(super) fn relation_binding(
-        declaration: &Relation,
+        relation: u64,
         operation: &BindingOperation,
         stratum: usize,
         scope: Scope,
     ) -> Self {
-        let relation = declaration.fingerprint();
-        let columns = declaration.arity();
         match operation {
-            BindingOperation::Aggregation => {
-                let target = declaration.lattice().map(|(target, _)| target);
-                Self::Aggregation {
-                    stratum,
-                    scope,
-                    relation,
-                    arities: Arities {
-                        key: (0..columns)
-                            .filter(|&column| Some(column) != target)
-                            .collect(),
-                        value: Vec::new(),
-                    },
-                }
-            }
-            BindingOperation::Dedup { order } => Self::Dedup {
+            BindingOperation::Aggregation { .. } => Self::Aggregation {
                 stratum,
                 scope,
                 relation,
-                arities: Arities {
-                    key: order.clone(),
-                    value: Vec::new(),
-                },
+            },
+            BindingOperation::Dedup { .. } => Self::Dedup {
+                stratum,
+                scope,
+                relation,
             },
         }
     }
+}
+
+// =============================================================================
+// TransformationId and JoinOrientation
+// =============================================================================
+
+/// A step's location, including joins that produce only a row collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct TransformationId {
+    pub(super) stratum: usize,
+    pub(super) scope: Scope,
+    pub(super) transformation: usize,
+}
+
+/// Which planned input supplies the left side of an ordinary join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JoinOrientation {
+    Original,
+    Swapped,
 }
 
 // =============================================================================
@@ -120,11 +121,15 @@ impl PhysicalArrangement {
 /// Row-only steps retain their field mappings without becoming nodes.
 /// Borrowed steps reference the plan; owned steps compose projections for
 /// one feed without rewriting the shared collection's other consumers.
+/// Cloning copies the feed tree, including synthesized projections, so each
+/// consumer can fuse its own path while the underlying collections stay shared.
 #[derive(Clone)]
 pub(super) enum Producer<'plan> {
+    /// A collection outside this graph, whose layout is a boundary condition.
     External(u64),
     Arrangement(PhysicalArrangement),
     Transformation {
+        id: TransformationId,
         step: Cow<'plan, Transformation>,
         sources: Vec<Producer<'plan>>,
     },
@@ -140,8 +145,9 @@ impl fmt::Debug for Producer<'_> {
             Self::Arrangement(node) => node.fmt(f),
             // The full step also prints collections and canonical forms;
             // only the operation, mappings and feeds belong in this graph.
-            Self::Transformation { step, sources } => f
+            Self::Transformation { id, step, sources } => f
                 .debug_struct(step.operation_name())
+                .field("id", id)
                 .field("sources", sources)
                 .field("flow", step.flow())
                 .finish(),
@@ -164,76 +170,16 @@ pub(super) struct Edge<'plan> {
 }
 
 // =============================================================================
-// Graph
+// ArrangementGraph
 // =============================================================================
 
+/// Sorting boundaries and the expressions that feed them. Each node stores
+/// one selected field order, initialized from the plan, rather than a domain
+/// of permutations. Edges reference stable identities; changing an order does
+/// not invalidate them. Feed references can form cycles through feedback.
 #[derive(Debug, Default)]
-pub(super) struct Graph<'plan> {
-    pub(super) nodes: BTreeSet<PhysicalArrangement>,
+pub(super) struct ArrangementGraph<'plan> {
+    pub(super) nodes: BTreeMap<PhysicalArrangement, Arities>,
+    pub(super) joins: BTreeMap<TransformationId, JoinOrientation>,
     pub(super) edges: Vec<Edge<'plan>>,
-}
-
-#[cfg(test)]
-mod tests {
-    use flowlog_common::compute_fp;
-    use flowlog_parser::test_harness::program;
-    use rstest::rstest;
-
-    use super::*;
-
-    // Cases: declaration fields, grouping columns.
-    #[rstest]
-    #[case("a: min<int32>, b: int32, c: int32", &[1, 2])]
-    #[case("a: int32, b: min<int32>, c: int32", &[0, 2])]
-    #[case("a: int32, b: int32, c: min<int32>", &[0, 1])]
-    #[case("a: min<int32>", &[])]
-    fn aggregation_arities_exclude_the_aggregated_column(
-        #[case] fields: &str,
-        #[case] expected_key: &[usize],
-    ) {
-        let program = program(&format!(
-            r#"
-            .decl R({fields})
-            .input R(IO="file", filename="R.csv")
-            .output R
-            "#,
-        ));
-        let declaration = program.relation_by_fingerprint(compute_fp("r")).unwrap();
-        let node = PhysicalArrangement::relation_binding(
-            declaration,
-            &BindingOperation::Aggregation,
-            0,
-            Scope::NonRecursive,
-        );
-        let PhysicalArrangement::Aggregation { arities, .. } = node else {
-            panic!("a declared min column selects aggregation");
-        };
-        assert_eq!(arities.key, expected_key);
-        assert!(arities.value.is_empty());
-    }
-
-    #[test]
-    fn dedup_arities_include_every_row_column_in_one_block() {
-        let program = program(
-            r#"
-            .decl R(a: int32, b: int32, c: int32)
-            .input R(IO="file", filename="R.csv")
-            .output R
-            "#,
-        );
-        let declaration = program.relation_by_fingerprint(compute_fp("r")).unwrap();
-        let node = PhysicalArrangement::relation_binding(
-            declaration,
-            &BindingOperation::Dedup {
-                order: vec![0, 1, 2],
-            },
-            0,
-            Scope::NonRecursive,
-        );
-        let PhysicalArrangement::Dedup { arities, .. } = node else {
-            panic!("an ordinary relation selects dedup");
-        };
-        assert_eq!(arities.key, [0, 1, 2]);
-        assert!(arities.value.is_empty());
-    }
 }

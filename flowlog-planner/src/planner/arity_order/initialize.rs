@@ -7,13 +7,16 @@ use std::sync::Arc;
 
 use flowlog_parser::Program;
 
-use super::graph::Arities;
-use super::graph::Edge;
-use super::graph::Graph;
-use super::graph::PhysicalArrangement;
-use super::graph::Producer;
-use super::graph::Scope;
+use super::arrangement_graph::Arities;
+use super::arrangement_graph::ArrangementGraph;
+use super::arrangement_graph::Edge;
+use super::arrangement_graph::JoinOrientation;
+use super::arrangement_graph::PhysicalArrangement;
+use super::arrangement_graph::Producer;
+use super::arrangement_graph::Scope;
+use super::arrangement_graph::TransformationId;
 use crate::planner::ArithmeticArgument;
+use crate::planner::BindingOperation;
 use crate::planner::FactorArgument;
 use crate::planner::StratumPlanner;
 use crate::planner::Transformation;
@@ -36,8 +39,8 @@ pub(super) fn initialize<'plan>(
     upstream: &[StratumPlanner],
     downstream: &'plan [StratumPlanner],
     program: &Program,
-) -> Graph<'plan> {
-    let mut graph = Graph::default();
+) -> ArrangementGraph<'plan> {
+    let mut graph = ArrangementGraph::default();
     // A relation can gain rule results after being bound by an earlier
     // stratum. Preserve that binding even if no body reads the relation.
     let earlier_relations = upstream.iter().flat_map(StratumPlanner::output_relations);
@@ -69,7 +72,7 @@ fn initialize_stratum<'plan>(
     stratum: &'plan StratumPlanner,
     program: &Program,
     bindings: &mut Bindings<'plan>,
-    graph: &mut Graph<'plan>,
+    graph: &mut ArrangementGraph<'plan>,
 ) {
     // Relation bindings and loop entries can read prelude results, so resolve
     // those producers before replacing any earlier relation binding.
@@ -85,14 +88,14 @@ fn initialize_stratum<'plan>(
     if !stratum.is_recursive() {
         // All results read the incoming bindings and the completed prelude.
         // Publish them together so map iteration cannot change lineage.
-        let mut relation_results = BTreeMap::new();
+        let mut relation_results: Bindings<'plan> = BTreeMap::new();
         for declaration in program.relations() {
             let relation = declaration.fingerprint();
             let Some(binding) = stratum.relation_bindings().get(&relation) else {
                 continue;
             };
             let node = PhysicalArrangement::relation_binding(
-                declaration,
+                relation,
                 binding.operation(),
                 index,
                 Scope::NonRecursive,
@@ -108,7 +111,9 @@ fn initialize_stratum<'plan>(
                     .iter()
                     .map(|&fingerprint| resolve_producer(fingerprint, bindings, None)),
             );
-            graph.nodes.insert(node.clone());
+            graph
+                .nodes
+                .insert(node.clone(), binding_arities(binding.operation()));
             graph.edges.push(Edge {
                 input: Producer::Union(parts),
                 output: node.clone(),
@@ -132,7 +137,7 @@ fn initialize_stratum<'plan>(
     // Keep the seed bindings separate: feedback must shadow body reads
     // of R without replacing the outer R that feeds the binding's union.
     let mut recursive_bindings = entered.clone();
-    let mut relation_results = BTreeMap::new();
+    let mut relation_results: Bindings<'plan> = BTreeMap::new();
     // Reserve binding identities before the body so its feedback sources
     // can reference nodes whose incoming edges have not been filled yet.
     for declaration in program.relations() {
@@ -141,12 +146,14 @@ fn initialize_stratum<'plan>(
             continue;
         };
         let node = PhysicalArrangement::relation_binding(
-            declaration,
+            relation,
             binding.operation(),
             index,
             Scope::Recursive,
         );
-        graph.nodes.insert(node.clone());
+        graph
+            .nodes
+            .insert(node.clone(), binding_arities(binding.operation()));
         relation_results.insert(relation, Producer::Arrangement(node));
     }
     // A recursive feed references the binding arrangement directly; neither
@@ -170,7 +177,7 @@ fn initialize_stratum<'plan>(
             continue;
         };
         let node = PhysicalArrangement::relation_binding(
-            declaration,
+            relation,
             binding.operation(),
             index,
             Scope::Recursive,
@@ -198,33 +205,65 @@ fn initialize_stratum<'plan>(
     }
 }
 
-/// Composes projection feeds until a keyed output materializes them.
-/// Binary sources retain their left-to-right order.
+/// Keeps binding field IDs in logical row coordinates: codegen restores
+/// those coordinates after sorting and before feedback or scope exit.
+#[must_use]
+fn binding_arities(operation: &BindingOperation) -> Arities {
+    let (BindingOperation::Dedup { order } | BindingOperation::Aggregation { order }) = operation;
+    Arities {
+        key: order.clone(),
+        value: Vec::new(),
+    }
+}
+
+/// Publishes each step's producer in dependency order. Keyed outputs become
+/// graph nodes; row outputs remain feed expressions with projections composed
+/// across row-only steps. Binary sources retain their left-to-right order.
 fn initialize_transformations<'plan>(
     stratum: usize,
     scope: Scope,
     transformations: &'plan [Transformation],
     bindings: &mut Bindings<'plan>,
     outer: Option<&Bindings<'plan>>,
-    graph: &mut Graph<'plan>,
+    graph: &mut ArrangementGraph<'plan>,
 ) {
     let steps = transformations.iter().enumerate();
     for (transformation, step) in steps {
+        if matches!(
+            step,
+            Transformation::JnToRow { .. } | Transformation::JnToKv { .. }
+        ) {
+            graph.joins.insert(
+                TransformationId {
+                    stratum,
+                    scope,
+                    transformation,
+                },
+                JoinOrientation::Original,
+            );
+        }
         let inputs = step.input_fingerprints();
         let sources: Vec<Producer<'plan>> = inputs
             .into_iter()
             .map(|fingerprint| resolve_producer(fingerprint, bindings, outer))
             .collect();
-        let expression = fuse_projections(step, sources);
+        let expression = fuse_projections(
+            TransformationId {
+                stratum,
+                scope,
+                transformation,
+            },
+            step,
+            sources,
+        );
         let output = if step.need_arrange() {
             let (key, value) = step.output().arity();
             let node = PhysicalArrangement::Arrangement {
                 stratum,
                 scope,
                 transformation,
-                arities: Arities::new(key, value),
             };
-            graph.nodes.insert(node.clone());
+            graph.nodes.insert(node.clone(), Arities::new(key, value));
             graph.edges.push(Edge {
                 input: expression,
                 output: node.clone(),
@@ -260,6 +299,7 @@ fn resolve_producer<'plan>(
 /// filters and computed expressions stop fusion. Shared feeds stay intact.
 #[must_use]
 fn fuse_projections<'plan>(
+    id: TransformationId,
     step: &'plan Transformation,
     mut sources: Vec<Producer<'plan>>,
 ) -> Producer<'plan> {
@@ -269,6 +309,7 @@ fn fuse_projections<'plan>(
             Producer::Transformation {
                 step: previous,
                 sources: previous_sources,
+                ..
             },
         ] = sources.as_mut_slice()
         else {
@@ -316,11 +357,12 @@ fn fuse_projections<'plan>(
         });
         sources = mem::take(previous_sources);
     }
-    Producer::Transformation { step, sources }
+    Producer::Transformation { id, step, sources }
 }
 
-/// Resolves two column-only maps into one mapping over the earlier
-/// input. Predicates and computed expressions cannot be elided here.
+/// Composes two column-only maps over the earlier input. Returns `None` if
+/// either map has a predicate or computed expression, if a flow is not a map,
+/// or if a projected column has no source position.
 #[must_use]
 fn compose_projection(
     projection: &TransformationFlow,
@@ -393,11 +435,67 @@ fn compose_projection(
 #[cfg(test)]
 mod tests {
     use flowlog_common::compute_fp;
+    use flowlog_parser::ArithmeticOperator;
+    use flowlog_parser::Constant;
+    use flowlog_parser::DataType;
     use flowlog_parser::test_harness::program;
+    use rstest::rstest;
 
     use super::*;
-    use crate::planner::BindingOperation;
+    use crate::planner::Constraints;
     use crate::planner::ProgramPlanner;
+
+    /// Projection fusion changes graph feeds, not planned transformations,
+    /// so refusal to fuse cannot be observed through the returned plan.
+    // Cases: predicates, output expression.
+    #[rstest]
+    #[case::equality_filter(
+        Constraints::new(
+            vec![(TransformationArgument::KV((false, 0)), Constant::new(DataType::Int32, "1"))],
+            vec![],
+        ),
+        ArithmeticArgument {
+            init: FactorArgument::Var(TransformationArgument::KV((false, 0))),
+            rest: vec![],
+        }
+    )]
+    #[case::arithmetic(
+        Constraints::new(vec![], vec![]),
+        ArithmeticArgument {
+            init: FactorArgument::Var(TransformationArgument::KV((false, 0))),
+            rest: vec![(ArithmeticOperator::Plus, FactorArgument::Const(Constant::new(DataType::Int32, "1")))],
+        }
+    )]
+    #[case::constant(
+        Constraints::new(vec![], vec![]),
+        ArithmeticArgument {
+            init: FactorArgument::Const(Constant::new(DataType::Int32, "1")),
+            rest: vec![],
+        }
+    )]
+    fn predicates_and_expressions_stop_projection_composition(
+        #[case] predicates: Constraints,
+        #[case] expression: ArithmeticArgument,
+    ) {
+        let plain = TransformationFlow::KVToKV {
+            key: Arc::new(vec![]),
+            value: Arc::new(vec![ArithmeticArgument {
+                init: FactorArgument::Var(TransformationArgument::KV((false, 0))),
+                rest: vec![],
+            }]),
+            constraints: Constraints::new(vec![], vec![]),
+            compares: vec![],
+        };
+        let blocked = TransformationFlow::KVToKV {
+            key: Arc::new(vec![]),
+            value: Arc::new(vec![expression]),
+            constraints: predicates,
+            compares: vec![],
+        };
+
+        assert!(compose_projection(&plain, &blocked).is_none());
+        assert!(compose_projection(&blocked, &plain).is_none());
+    }
 
     /// Sharing reads S0's (b,c) stream to build S1's (c) index. Fuse that
     /// path while preserving the (b,c) feed into Mid's dedup.
@@ -437,7 +535,7 @@ mod tests {
                 )
             })
             .expect("the downstream c index");
-        let Producer::Transformation { step, sources } = &index.input else {
+        let Producer::Transformation { step, sources, .. } = &index.input else {
             panic!("the c index has a projection feed");
         };
         assert_eq!(step.unary_input().arity(), (0, 3));
@@ -463,10 +561,6 @@ mod tests {
                         stratum: 0,
                         scope: Scope::NonRecursive,
                         relation: compute_fp("mid"),
-                        arities: Arities {
-                            key: vec![0, 1],
-                            value: vec![],
-                        },
                     }
             })
             .expect("Mid's dedup");
@@ -527,15 +621,17 @@ mod tests {
             order: vec![2, 0, 1],
         };
         let graph = initialize(&stratum, &[], &[], &program);
-        assert!(graph.nodes.contains(&PhysicalArrangement::Dedup {
-            stratum: 0,
-            scope: Scope::NonRecursive,
-            relation: compute_fp("r"),
-            arities: Arities {
+        assert_eq!(
+            graph.nodes[&PhysicalArrangement::Dedup {
+                stratum: 0,
+                scope: Scope::NonRecursive,
+                relation: compute_fp("r"),
+            }],
+            Arities {
                 key: vec![2, 0, 1],
                 value: vec![]
             },
-        }));
+        );
     }
 
     #[test]
@@ -570,10 +666,6 @@ mod tests {
                         stratum: 0,
                         scope: Scope::NonRecursive,
                         relation: compute_fp("r"),
-                        arities: Arities {
-                            key: vec![0],
-                            value: vec![],
-                        },
                     }
             })
             .expect("R's later dedup");
@@ -589,6 +681,49 @@ mod tests {
         };
         assert_eq!(*seed, compute_fp("r"));
         assert!(matches!(step.as_ref(), Transformation::JnToRow { .. }));
+    }
+
+    #[test]
+    fn recursive_feedback_references_the_binding_without_replacing_its_seed() {
+        let program = program(
+            r#"
+            .decl Arc(x: int32, y: int32)
+            .input Arc
+            .decl Reach(x: int32, y: int32)
+            .output Reach
+            Reach(x,y) :- Arc(x,y).
+            Reach(x,z) :- Reach(x,y), Arc(y,z).
+            "#,
+        );
+        let plan = ProgramPlanner::from_program(&program, &mut None).expect("planned");
+        let [base, recursive] = plan.strata() else {
+            panic!("Reach has a base stratum and a recursive stratum");
+        };
+        let graph = initialize(recursive, std::slice::from_ref(base), &[], &program);
+        let relation = compute_fp("reach");
+        let expected = PhysicalArrangement::Dedup {
+            stratum: 0,
+            scope: Scope::Recursive,
+            relation,
+        };
+        let binding = graph
+            .edges
+            .iter()
+            .find(|edge| edge.output == expected)
+            .expect("Reach's recursive binding");
+        let Producer::Union(parts) = &binding.input else {
+            panic!("Reach's binding retains its seed and rule results");
+        };
+        assert!(matches!(parts.first(), Some(Producer::External(seed)) if *seed == relation));
+        assert!(graph.edges.iter().any(|edge| {
+            matches!(
+                &edge.input,
+                Producer::Transformation { sources, .. }
+                    if sources.iter().any(|source| {
+                        matches!(source, Producer::Arrangement(node) if node == &expected)
+                    })
+            )
+        }));
     }
 
     #[test]
@@ -618,17 +753,13 @@ mod tests {
                         stratum: 1,
                         scope: Scope::NonRecursive,
                         relation: compute_fp("out"),
-                        arities: Arities {
-                            key: vec![0],
-                            value: vec![],
-                        },
                     }
             })
             .expect("Out's dedup");
         let Producer::Union(parts) = &out.input else {
             panic!("Out's binding retains its union feeds");
         };
-        let [Producer::Transformation { step, sources }] = parts.as_slice() else {
+        let [Producer::Transformation { step, sources, .. }] = parts.as_slice() else {
             panic!("Out has one projection feed");
         };
         assert_eq!(step.unary_input().arity(), (0, 2));

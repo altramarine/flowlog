@@ -45,7 +45,7 @@ impl Codegen {
         };
         let (rows_order, dedup) = match operation {
             BindingOperation::Dedup { order } => (Some(order.as_slice()), true),
-            BindingOperation::Aggregation => (None, false),
+            BindingOperation::Aggregation { .. } => (None, false),
         };
         let mutability = rest
             .iter()
@@ -96,8 +96,8 @@ impl Codegen {
 
         match operation {
             BindingOperation::Dedup { .. } => Ok((rows, mutability)),
-            BindingOperation::Aggregation => {
-                self.gen_lattice_merge(idb_fp, rows, mutability, output, plan_graph)
+            BindingOperation::Aggregation { order } => {
+                self.gen_lattice_merge(idb_fp, rows, mutability, order, output, plan_graph)
             }
         }
     }
@@ -286,7 +286,7 @@ mod tests {
             .gen_relation_binding(
                 s,
                 &parts,
-                &BindingOperation::Aggregation,
+                &BindingOperation::Aggregation { order: vec![0] },
                 &ident("r"),
                 /*recursive*/ false,
                 &mut None,
@@ -318,7 +318,7 @@ mod tests {
             .gen_relation_binding(
                 relation,
                 &[(ident("rows"), Mutability::Static)],
-                &BindingOperation::Aggregation,
+                &BindingOperation::Aggregation { order: vec![0] },
                 &ident("out"),
                 /*recursive*/ false,
                 &mut None,
@@ -330,6 +330,40 @@ mod tests {
                 .to_string()
                 .contains("relation `S` has no declared min/max column"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn an_aggregation_binding_uses_the_planned_group_order_and_restores_the_row() {
+        let codegen = codegen(
+            r#"
+            .decl E(a: int32, b: int32, c: int32)
+            .input E
+            .decl R(a: int32, b: min<int32>, c: int32)
+            .output R
+            R(a,b,c) :- E(a,b,c).
+        "#,
+        );
+        let (rows, _) = codegen
+            .gen_relation_binding(
+                flowlog_common::compute_fp("r"),
+                &[(ident("rows"), Mutability::Static)],
+                &BindingOperation::Aggregation { order: vec![2, 0] },
+                &ident("r"),
+                /*recursive*/ false,
+                &mut None,
+            )
+            .unwrap();
+        assert_eq!(
+            rows.to_string(),
+            quote! {
+                ::flowlog_runtime::operators::flowlog_lattice(
+                    rows.clone(), "Merge: R", ::flowlog_runtime::operators::Min,
+                    |(x0, x1, x2)| ((x2, x0), x1),
+                    |(k0, k1), v: i32| (k1, v, k0),
+                )
+            }
+            .to_string()
         );
     }
 
